@@ -8,6 +8,11 @@ import { usePlatform } from '@/hooks/usePlatform';
 import { MACOS_SYSTEM_AUDIO_VERIFIED_KEY } from '@/hooks/usePermissionCheck';
 import { OnboardingContainer } from '../OnboardingContainer';
 import { Mic, Volume2, RefreshCw } from 'lucide-react';
+import {
+  DEFAULT_DEVICE_OPTION,
+  preferenceForSelection,
+  resolveSelectedDeviceName,
+} from '@/lib/audio-devices';
 
 interface AudioDevice {
   name: string;
@@ -43,6 +48,11 @@ export function AudioTestStep() {
   const [status, setStatus] = useState('Starting meters…');
   const [inputs, setInputs] = useState<AudioDevice[]>([]);
   const [outputs, setOutputs] = useState<AudioDevice[]>([]);
+  // What the backend reports as the current system defaults, so the "Default"
+  // entries meter the device the user is actually on rather than the first one
+  // enumerated.
+  const [defaultMic, setDefaultMic] = useState<string | null>(null);
+  const [defaultSys, setDefaultSys] = useState<string | null>(null);
   const [micName, setMicName] = useState<string>('');
   const [sysName, setSysName] = useState<string>('');
   const monitoring = useRef(false);
@@ -170,10 +180,24 @@ export function AudioTestStep() {
       setInputs(inputList);
       setOutputs(outputList);
 
-      const nextMic = inputList[0]?.name || '';
-      const nextSys = outputList[0]?.name || '';
-      setMicName(nextMic);
-      setSysName(nextSys);
+      // Best effort: without it the Default entries simply have nothing to
+      // resolve to, which the empty-name checks below already handle.
+      const defaults = await invoke<{ mic_device: string | null; system_device: string | null }>(
+        'get_default_audio_devices',
+      ).catch(() => ({ mic_device: null, system_device: null }));
+      if (!active.current || run !== deviceLoad.current) return;
+      setDefaultMic(defaults.mic_device);
+      setDefaultSys(defaults.system_device);
+
+      // Start on "Default" rather than the first enumerated device, which is
+      // rarely the one the user is actually listening on.
+      setMicName(DEFAULT_DEVICE_OPTION);
+      setSysName(DEFAULT_DEVICE_OPTION);
+
+      const nextMic = resolveSelectedDeviceName(DEFAULT_DEVICE_OPTION, defaults.mic_device)
+        || inputList[0]?.name || '';
+      const nextSys = resolveSelectedDeviceName(DEFAULT_DEVICE_OPTION, defaults.system_device)
+        || outputList[0]?.name || '';
 
       if (!nextMic && !nextSys) {
         setError('No audio devices detected. Plug in a microphone and check system privacy settings.');
@@ -246,16 +270,43 @@ export function AudioTestStep() {
     };
   }, [loadDevicesAndStart, queueStop]);
 
-  const onMicChange = async (name: string) => {
-    setMicName(name);
-    setMicHeard(false);
-    await startMeters(name, sysName);
+  /**
+   * Carry the onboarding choice into recording preferences, so a device picked
+   * here is the one actually used later. Selecting Default stores null, which is
+   * how the backend represents "follow the system default" — pinning the current
+   * default device's name instead would defeat the point.
+   *
+   * Best effort: onboarding must never be blocked by a preferences write.
+   */
+  const persistChoice = async (micSelection: string, sysSelection: string) => {
+    try {
+      const preferences = await invoke<Record<string, unknown>>('get_recording_preferences');
+      await invoke('set_recording_preferences', {
+        preferences: {
+          ...preferences,
+          preferred_mic_device: preferenceForSelection(micSelection, 'Input'),
+          // macOS follows the current output route and ignores a stored
+          // selection, matching the main settings picker.
+          preferred_system_device: isMacOS ? null : preferenceForSelection(sysSelection, 'Output'),
+        },
+      });
+    } catch (e) {
+      console.error('Failed to save onboarding device choice:', e);
+    }
   };
 
-  const onSysChange = async (name: string) => {
-    setSysName(name);
+  const onMicChange = async (selection: string) => {
+    setMicName(selection);
+    setMicHeard(false);
+    await persistChoice(selection, sysName);
+    await startMeters(resolveSelectedDeviceName(selection, defaultMic), resolveSelectedDeviceName(sysName, defaultSys));
+  };
+
+  const onSysChange = async (selection: string) => {
+    setSysName(selection);
     setSysHeard(false);
-    await startMeters(micName, name);
+    await persistChoice(micName, selection);
+    await startMeters(resolveSelectedDeviceName(micName, defaultMic), resolveSelectedDeviceName(selection, defaultSys));
   };
 
   const finish = async () => {
@@ -318,6 +369,9 @@ export function AudioTestStep() {
               value={micName}
               onChange={(e) => void onMicChange(e.target.value)}
             >
+              <option value={DEFAULT_DEVICE_OPTION}>
+                {defaultMic ? `Default Microphone (${defaultMic})` : 'Default Microphone'}
+              </option>
               {inputs.map((d) => (
                 <option key={d.name} value={d.name}>
                   {d.name}
@@ -349,6 +403,9 @@ export function AudioTestStep() {
               value={sysName}
               onChange={(e) => void onSysChange(e.target.value)}
             >
+              <option value={DEFAULT_DEVICE_OPTION}>
+                {defaultSys ? `Default System Audio (${defaultSys})` : 'Default System Audio'}
+              </option>
               {outputs.map((d) => (
                 <option key={d.name} value={d.name}>
                   {d.name}
