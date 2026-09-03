@@ -41,6 +41,28 @@ pub fn default_output_device() -> Result<AudioDevice> {
         // (see audio/capture/pulse_linux.rs), not via cpal's ALSA host, so the
         // "default" device must be one of the real Pulse sinks, decorated the
         // same way configure_linux_audio() lists them.
+        //
+        // Ask the server which sink is actually the default output, so "Default
+        // System Audio" follows whatever the user is listening on (Bluetooth,
+        // jack, built-in) instead of pinning one device.
+        match crate::audio::capture::default_sink_label() {
+            Ok(Some(label)) => {
+                return Ok(AudioDevice::new(
+                    format!("{} (System Audio)", label),
+                    DeviceType::Output,
+                ));
+            }
+            Ok(None) => warn!(
+                "🔊 No default PulseAudio/PipeWire sink reported; falling back to the first sink"
+            ),
+            Err(e) => warn!(
+                "🔊 Failed to query the default PulseAudio/PipeWire sink ({}); falling back to the first sink",
+                e
+            ),
+        }
+
+        // Last resort. System audio is optional, so never turn "wrong device"
+        // into "no device" by erroring out here.
         let sinks = crate::audio::capture::list_pulse_sinks()
             .map_err(|e| anyhow!("Failed to list PulseAudio/PipeWire sinks: {}", e))?;
         let sink = sinks
