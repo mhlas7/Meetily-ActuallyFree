@@ -724,6 +724,7 @@ pub fn run() {
             whisper_engine::parallel_commands::prepare_audio_chunks,
             whisper_engine::parallel_commands::test_parallel_processing_setup,
             get_audio_devices,
+            audio::recording_commands::get_default_audio_devices,
             get_check_updates_on_launch,
             set_check_updates_on_launch,
             app_update::download_app_update,

@@ -7,8 +7,12 @@ import { useOnboarding } from '@/contexts/OnboardingContext';
 import { usePlatform } from '@/hooks/usePlatform';
 import { MACOS_SYSTEM_AUDIO_VERIFIED_KEY } from '@/hooks/usePermissionCheck';
 import { OnboardingContainer } from '../OnboardingContainer';
-import { Check, Mic, Volume2, RefreshCw } from 'lucide-react';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Mic, Volume2, RefreshCw } from 'lucide-react';
+import {
+  DEFAULT_DEVICE_OPTION,
+  preferenceForSelection,
+  resolveSelectedDeviceName,
+} from '@/lib/audio-devices';
 
 interface AudioDevice {
   name: string;
@@ -44,6 +48,11 @@ export function AudioTestStep() {
   const [status, setStatus] = useState('Starting meters…');
   const [inputs, setInputs] = useState<AudioDevice[]>([]);
   const [outputs, setOutputs] = useState<AudioDevice[]>([]);
+  // What the backend reports as the current system defaults, so the "Default"
+  // entries meter the device the user is actually on rather than the first one
+  // enumerated.
+  const [defaultMic, setDefaultMic] = useState<string | null>(null);
+  const [defaultSys, setDefaultSys] = useState<string | null>(null);
   const [micName, setMicName] = useState<string>('');
   const [sysName, setSysName] = useState<string>('');
   const monitoring = useRef(false);
@@ -171,10 +180,24 @@ export function AudioTestStep() {
       setInputs(inputList);
       setOutputs(outputList);
 
-      const nextMic = inputList[0]?.name || '';
-      const nextSys = outputList[0]?.name || '';
-      setMicName(nextMic);
-      setSysName(nextSys);
+      // Best effort: without it the Default entries simply have nothing to
+      // resolve to, which the empty-name checks below already handle.
+      const defaults = await invoke<{ mic_device: string | null; system_device: string | null }>(
+        'get_default_audio_devices',
+      ).catch(() => ({ mic_device: null, system_device: null }));
+      if (!active.current || run !== deviceLoad.current) return;
+      setDefaultMic(defaults.mic_device);
+      setDefaultSys(defaults.system_device);
+
+      // Start on "Default" rather than the first enumerated device, which is
+      // rarely the one the user is actually listening on.
+      setMicName(DEFAULT_DEVICE_OPTION);
+      setSysName(DEFAULT_DEVICE_OPTION);
+
+      const nextMic = resolveSelectedDeviceName(DEFAULT_DEVICE_OPTION, defaults.mic_device)
+        || inputList[0]?.name || '';
+      const nextSys = resolveSelectedDeviceName(DEFAULT_DEVICE_OPTION, defaults.system_device)
+        || outputList[0]?.name || '';
 
       if (!nextMic && !nextSys) {
         setError('No audio devices detected. Plug in a microphone and check system privacy settings.');
@@ -247,16 +270,43 @@ export function AudioTestStep() {
     };
   }, [loadDevicesAndStart, queueStop]);
 
-  const onMicChange = async (name: string) => {
-    setMicName(name);
-    setMicHeard(false);
-    await startMeters(name, sysName);
+  /**
+   * Carry the onboarding choice into recording preferences, so a device picked
+   * here is the one actually used later. Selecting Default stores null, which is
+   * how the backend represents "follow the system default" — pinning the current
+   * default device's name instead would defeat the point.
+   *
+   * Best effort: onboarding must never be blocked by a preferences write.
+   */
+  const persistChoice = async (micSelection: string, sysSelection: string) => {
+    try {
+      const preferences = await invoke<Record<string, unknown>>('get_recording_preferences');
+      await invoke('set_recording_preferences', {
+        preferences: {
+          ...preferences,
+          preferred_mic_device: preferenceForSelection(micSelection, 'Input'),
+          // macOS follows the current output route and ignores a stored
+          // selection, matching the main settings picker.
+          preferred_system_device: isMacOS ? null : preferenceForSelection(sysSelection, 'Output'),
+        },
+      });
+    } catch (e) {
+      console.error('Failed to save onboarding device choice:', e);
+    }
   };
 
-  const onSysChange = async (name: string) => {
-    setSysName(name);
+  const onMicChange = async (selection: string) => {
+    setMicName(selection);
+    setMicHeard(false);
+    await persistChoice(selection, sysName);
+    await startMeters(resolveSelectedDeviceName(selection, defaultMic), resolveSelectedDeviceName(sysName, defaultSys));
+  };
+
+  const onSysChange = async (selection: string) => {
+    setSysName(selection);
     setSysHeard(false);
-    await startMeters(micName, name);
+    await persistChoice(micName, selection);
+    await startMeters(resolveSelectedDeviceName(micName, defaultMic), resolveSelectedDeviceName(selection, defaultSys));
   };
 
   const finish = async () => {
@@ -274,12 +324,15 @@ export function AudioTestStep() {
     <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--af-panel-2)]">
       <div
         className={`h-full rounded-full transition-all duration-75 ${
-          ok ? 'bg-af-success' : 'bg-[var(--af-accent)]'
+          ok ? 'bg-emerald-500' : 'bg-[var(--af-accent)]'
         }`}
         style={{ width: `${Math.min(100, Math.round(Math.max(rms, 0) * 500))}%` }}
       />
     </div>
   );
+
+  const selectClass =
+    'w-full rounded-lg border border-[var(--af-border)] bg-[var(--af-panel-2)] px-3 py-2 text-sm text-[var(--af-text)] outline-none focus:border-[var(--af-accent)]';
 
   return (
     <OnboardingContainer
@@ -304,21 +357,27 @@ export function AudioTestStep() {
         <div className="rounded-xl border border-[var(--af-border)] bg-[var(--af-panel)] p-4 space-y-3">
           <div className="flex items-center justify-between text-sm font-medium text-[var(--af-text)]">
             <span className="inline-flex items-center gap-2">
-              <Mic size={16} className="text-af-accent" /> Microphone
+              <Mic size={16} className="text-blue-400" /> Microphone
             </span>
-            <span className={micHeard ? 'text-af-success text-xs' : 'text-[var(--af-text-3)] text-xs'}>
-              {micHeard ? (
-                <span className="inline-flex items-center gap-1">
-                  <Check className="h-3.5 w-3.5" />
-                  Heard you
-                </span>
-              ) : (
-                'Speak now…'
-              )}
+            <span className={micHeard ? 'text-emerald-400 text-xs' : 'text-[var(--af-text-3)] text-xs'}>
+              {micHeard ? 'Heard you ✓' : 'Speak now…'}
             </span>
           </div>
           {inputs.length > 0 ? (
-            <DeviceSelect label="Microphone" value={micName} devices={inputs} onChange={(name) => void onMicChange(name)} />
+            <select
+              className={selectClass}
+              value={micName}
+              onChange={(e) => void onMicChange(e.target.value)}
+            >
+              <option value={DEFAULT_DEVICE_OPTION}>
+                {defaultMic ? `Default Microphone (${defaultMic})` : 'Default Microphone'}
+              </option>
+              {inputs.map((d) => (
+                <option key={d.name} value={d.name}>
+                  {d.name}
+                </option>
+              ))}
+            </select>
           ) : (
             <p className="text-xs text-[var(--af-text-3)]">No microphones found</p>
           )}
@@ -328,17 +387,10 @@ export function AudioTestStep() {
         <div className="rounded-xl border border-[var(--af-border)] bg-[var(--af-panel)] p-4 space-y-3">
           <div className="flex items-center justify-between text-sm font-medium text-[var(--af-text)]">
             <span className="inline-flex items-center gap-2">
-              <Volume2 size={16} className="text-af-accent" /> System audio
+              <Volume2 size={16} className="text-purple-400" /> System audio
             </span>
-            <span className={sysHeard ? 'text-af-success text-xs' : 'text-[var(--af-text-3)] text-xs'}>
-              {sysHeard ? (
-                <span className="inline-flex items-center gap-1">
-                  <Check className="h-3.5 w-3.5" />
-                  Detected
-                </span>
-              ) : (
-                'Play a video…'
-              )}
+            <span className={sysHeard ? 'text-emerald-400 text-xs' : 'text-[var(--af-text-3)] text-xs'}>
+              {sysHeard ? 'Detected ✓' : 'Play a video…'}
             </span>
           </div>
           {isMacOS && outputs.length > 0 ? (
@@ -346,7 +398,20 @@ export function AudioTestStep() {
               Current default output (change it in System Settings)
             </p>
           ) : outputs.length > 0 ? (
-            <DeviceSelect label="System audio device" value={sysName} devices={outputs} onChange={(name) => void onSysChange(name)} />
+            <select
+              className={selectClass}
+              value={sysName}
+              onChange={(e) => void onSysChange(e.target.value)}
+            >
+              <option value={DEFAULT_DEVICE_OPTION}>
+                {defaultSys ? `Default System Audio (${defaultSys})` : 'Default System Audio'}
+              </option>
+              {outputs.map((d) => (
+                <option key={d.name} value={d.name}>
+                  {d.name}
+                </option>
+              ))}
+            </select>
           ) : (
             <p className="text-xs text-[var(--af-text-3)]">No playback devices found</p>
           )}
@@ -364,7 +429,7 @@ export function AudioTestStep() {
           </button>
         </div>
 
-        {error && <p className="text-center text-xs text-af-warning break-words">{error}</p>}
+        {error && <p className="text-center text-xs text-amber-400 break-words">{error}</p>}
         <p className="text-center text-xs text-[var(--af-text-3)]">
           You can finish even if a meter stays quiet — fix devices later in Settings → Recording.
         </p>
@@ -386,30 +451,3 @@ function shortName(name: string): string {
 }
 
 export default AudioTestStep;
-
-function DeviceSelect({
-  label,
-  value,
-  devices,
-  onChange,
-}: {
-  label: string;
-  value: string;
-  devices: Array<{ name: string }>;
-  onChange: (name: string) => void;
-}) {
-  return (
-    <Select value={value} onValueChange={onChange}>
-      <SelectTrigger aria-label={label}>
-        <SelectValue />
-      </SelectTrigger>
-      <SelectContent>
-        {devices.map((device) => (
-          <SelectItem key={device.name} value={device.name}>
-            {device.name}
-          </SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
-  );
-}

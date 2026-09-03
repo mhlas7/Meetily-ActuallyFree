@@ -35,3 +35,36 @@ export function deviceSelectValue(saved: string | null, available: string[]): st
 export function deviceDisplayName(stored: string): string {
   return stored.replace(/\s*\((input|output)\)$/i, '');
 }
+
+/** Sentinel value for the "use whatever the system default is" picker entry. */
+export const DEFAULT_DEVICE_OPTION = 'default';
+
+/**
+ * The device name to actually capture from for a given picker selection.
+ *
+ * `DEFAULT_DEVICE_OPTION` resolves to whatever the backend reports as the
+ * current system default; an empty string means no default was available, which
+ * callers treat as "nothing to meter".
+ */
+export function resolveSelectedDeviceName(
+  selection: string,
+  defaultName: string | null,
+): string {
+  if (!selection || selection === DEFAULT_DEVICE_OPTION) return defaultName ?? '';
+  return selection;
+}
+
+/**
+ * The value to persist in preferences for a picker selection.
+ *
+ * `null` means "follow the system default" — that is how the backend already
+ * represents an unset preference, so choosing Default must clear the field
+ * rather than pin the default device's current name.
+ */
+export function preferenceForSelection(
+  selection: string,
+  deviceType: 'Input' | 'Output',
+): string | null {
+  if (!selection || selection === DEFAULT_DEVICE_OPTION) return null;
+  return toDeviceOptionValue({ name: selection, device_type: deviceType });
+}
