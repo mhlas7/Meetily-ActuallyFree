@@ -30,6 +30,12 @@ use log::{info, warn};
 #[derive(Debug, Clone)]
 pub struct PulseSink {
     pub description: String,
+    /// The sink's own server name, e.g.
+    /// "alsa_output.pci-0000_c1_00.6.HiFi__Speaker__sink". Distinct from
+    /// `monitor_source_name` (that same sink's ".monitor" source, which is what
+    /// we actually capture from); this is what `ServerInfo::default_sink_name`
+    /// reports, so it is needed to identify the server's default output.
+    pub sink_name: String,
     pub monitor_source_name: String,
     /// What the picker shows. Equal to `description`, except when several sinks
     /// share one description — then the server name is appended so the rows are
@@ -68,6 +74,29 @@ fn build_labels(entries: &[(String, String)]) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Picker label of the sink the server reports as its default output.
+///
+/// Matches the sink's own name, falling back to the conventional
+/// "<sink>.monitor" mapping for servers that omit `SinkInfo::name`. Returns
+/// `None` when the default sink isn't in the list — it may have no monitor
+/// source, in which case `list_sinks` filtered it out and we cannot capture it.
+///
+/// Pure so it is unit-testable without a PulseAudio server.
+fn label_for_sink_name(sinks: &[PulseSink], default_sink_name: &str) -> Option<String> {
+    if default_sink_name.is_empty() {
+        return None;
+    }
+
+    sinks
+        .iter()
+        .find(|sink| sink.sink_name == default_sink_name)
+        .or_else(|| {
+            let monitor = format!("{}.monitor", default_sink_name);
+            sinks.iter().find(|sink| sink.monitor_source_name == monitor)
+        })
+        .map(|sink| sink.label.clone())
 }
 
 /// Resolve a stored device string to its PulseAudio name.
@@ -221,9 +250,10 @@ pub fn list_sinks() -> Result<Vec<PulseSink>> {
     let (mut mainloop, context) = connect()?;
 
     info!("🔊 pulse_linux::list_sinks: connected, requesting sink list");
-    // (description, monitor_source_name) pairs; labels are assigned after the
-    // full list is known, since disambiguation depends on the other entries.
-    let sinks: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+    // (description, sink_name, monitor_source_name) triples; labels are assigned
+    // after the full list is known, since disambiguation depends on the other
+    // entries.
+    let sinks: Rc<RefCell<Vec<(String, String, String)>>> = Rc::new(RefCell::new(Vec::new()));
     let sinks_cb = sinks.clone();
 
     let operation = context.introspect().get_sink_info_list(move |result| {
@@ -239,9 +269,13 @@ pub fn list_sinks() -> Result<Vec<PulseSink>> {
                 .unwrap_or("Unknown output")
                 .to_string();
 
-            sinks_cb
-                .borrow_mut()
-                .push((description, monitor_source_name.to_string()));
+            let sink_name = info.name.as_deref().unwrap_or_default().to_string();
+
+            sinks_cb.borrow_mut().push((
+                description,
+                sink_name,
+                monitor_source_name.to_string(),
+            ));
         }
     });
 
@@ -250,12 +284,23 @@ pub fn list_sinks() -> Result<Vec<PulseSink>> {
     drop(operation);
 
     let raw = sinks.borrow().clone();
-    let labels = build_labels(&raw);
+
+    // Deliberately keep feeding build_labels the monitor name, not sink_name:
+    // the bracketed discriminator it produces is persisted in user preferences,
+    // so changing it would silently orphan saved selections for devices with
+    // duplicate descriptions.
+    let label_input: Vec<(String, String)> = raw
+        .iter()
+        .map(|(description, _, monitor)| (description.clone(), monitor.clone()))
+        .collect();
+    let labels = build_labels(&label_input);
+
     let result: Vec<PulseSink> = raw
         .into_iter()
         .zip(labels)
-        .map(|((description, monitor_source_name), label)| PulseSink {
+        .map(|((description, sink_name, monitor_source_name), label)| PulseSink {
             description,
+            sink_name,
             monitor_source_name,
             label,
         })
@@ -277,6 +322,58 @@ pub fn resolve_monitor_source(stored: &str) -> Result<String> {
     let resolved = resolve_stored(&entries, stored, "sink")?;
     info!("🔍 resolve_monitor_source: '{}' -> '{}'", stored, resolved);
     Ok(resolved)
+}
+
+/// Picker label of the server's current default output sink, if any.
+///
+/// Used to resolve "Default System Audio" to whatever output the user is
+/// actually listening on — Bluetooth, jack, or built-in — rather than pinning
+/// one specific sink.
+pub fn default_sink_label() -> Result<Option<String>> {
+    info!("🔊 pulse_linux::default_sink_label: connecting");
+    let (mut mainloop, context) = connect()?;
+
+    info!("🔊 pulse_linux::default_sink_label: requesting server info");
+    let default_name: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let default_name_cb = default_name.clone();
+
+    let operation = context.introspect().get_server_info(move |info: &ServerInfo| {
+        if let Some(name) = info.default_sink_name.as_deref() {
+            *default_name_cb.borrow_mut() = Some(name.to_string());
+        }
+    });
+
+    run_operation_to_completion(&mut mainloop, &operation)?;
+    drop(operation);
+
+    let default_name = default_name.borrow().clone();
+    let Some(default_name) = default_name else {
+        warn!("🔊 pulse_linux::default_sink_label: server reported no default sink");
+        return Ok(None);
+    };
+
+    info!(
+        "🔊 pulse_linux::default_sink_label: default sink name is '{}'",
+        default_name
+    );
+
+    let sinks = list_sinks()?;
+    match label_for_sink_name(&sinks, &default_name) {
+        Some(label) => {
+            info!(
+                "🔊 pulse_linux::default_sink_label: default sink label is '{}'",
+                label
+            );
+            Ok(Some(label))
+        }
+        None => {
+            warn!(
+                "🔊 pulse_linux::default_sink_label: default sink '{}' has no capturable monitor source",
+                default_name
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// A PulseAudio input source (microphone, line-in, …), excluding sink monitors.
@@ -541,6 +638,71 @@ impl PulseCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sink(description: &str, sink_name: &str, monitor: &str, label: &str) -> PulseSink {
+        PulseSink {
+            description: description.to_string(),
+            sink_name: sink_name.to_string(),
+            monitor_source_name: monitor.to_string(),
+            label: label.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_label_for_sink_name_matches_sink_name() {
+        let sinks = vec![
+            sink("Speakers", "alsa_output.pci-0000", "alsa_output.pci-0000.monitor", "Speakers"),
+            sink("JBL Tune 770NC", "bluez_output.AC_12", "bluez_output.AC_12.monitor", "JBL Tune 770NC"),
+        ];
+        assert_eq!(
+            label_for_sink_name(&sinks, "bluez_output.AC_12"),
+            Some("JBL Tune 770NC".to_string())
+        );
+    }
+
+    #[test]
+    fn test_label_for_sink_name_falls_back_to_monitor_suffix() {
+        // A server that omits SinkInfo::name still resolves via the
+        // conventional "<sink>.monitor" naming.
+        let sinks = vec![sink("Speakers", "", "alsa_output.pci-0000.monitor", "Speakers")];
+        assert_eq!(
+            label_for_sink_name(&sinks, "alsa_output.pci-0000"),
+            Some("Speakers".to_string())
+        );
+    }
+
+    #[test]
+    fn test_label_for_sink_name_prefers_sink_name_over_monitor_suffix() {
+        // The suffix rule alone would pick the wrong entry here; pins precedence.
+        let sinks = vec![
+            sink("Wrong", "other_sink", "alsa_output.pci-0000.monitor", "Wrong"),
+            sink("Right", "alsa_output.pci-0000", "some_other.monitor", "Right"),
+        ];
+        assert_eq!(
+            label_for_sink_name(&sinks, "alsa_output.pci-0000"),
+            Some("Right".to_string())
+        );
+    }
+
+    #[test]
+    fn test_label_for_sink_name_returns_none_when_absent() {
+        // The disconnected-Bluetooth case: server still names a default sink
+        // that is no longer in the list.
+        let sinks = vec![sink("Speakers", "alsa_output.pci-0000", "alsa_output.pci-0000.monitor", "Speakers")];
+        assert_eq!(label_for_sink_name(&sinks, "bluez_output.GONE"), None);
+    }
+
+    #[test]
+    fn test_label_for_sink_name_returns_none_for_empty_list() {
+        assert_eq!(label_for_sink_name(&[], "alsa_output.pci-0000"), None);
+    }
+
+    #[test]
+    fn test_label_for_sink_name_returns_none_for_empty_default() {
+        // An empty default name must not match a sink that also has none.
+        let sinks = vec![sink("Speakers", "", "alsa_output.pci-0000.monitor", "Speakers")];
+        assert_eq!(label_for_sink_name(&sinks, ""), None);
+    }
 
     fn entry(label: &str, description: &str, name: &str) -> (String, String, String) {
         (label.to_string(), description.to_string(), name.to_string())
