@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use libpulse_binding::callbacks::ListResult;
@@ -103,33 +104,67 @@ fn resolve_stored(entries: &[(String, String, String)], stored: &str, kind: &str
     }
 }
 
-/// Pump the mainloop until `operation` finishes, blocking between iterations.
+/// Upper bound on any single blocking PulseAudio interaction.
+///
+/// `Mainloop::iterate(true)` blocks until the server sends something, so a
+/// server that accepts the connection but never completes the handshake — a
+/// dead `PULSE_SERVER` TCP endpoint, a stalled autospawn, a sandbox where the
+/// socket exists but is not wired through — would hang the caller forever.
+/// `configure_linux_audio()` runs on the device-monitor poll every few seconds
+/// while a recording is active, so an unbounded wait there stalls device
+/// monitoring rather than just one call. Every wait below is therefore
+/// deadline-bounded and iterates the mainloop non-blocking.
+const PULSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to sleep when a non-blocking mainloop iteration had nothing to do.
+const PULSE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Iterate the mainloop without blocking, returning how many events were
+/// dispatched. `while_doing` names the operation for error messages.
+fn pump(mainloop: &mut Mainloop, while_doing: &str) -> Result<u32> {
+    match mainloop.iterate(false) {
+        IterateResult::Quit(_) | IterateResult::Err(_) => Err(anyhow!(
+            "PulseAudio mainloop iteration failed while {}",
+            while_doing
+        )),
+        IterateResult::Success(dispatched) => Ok(dispatched),
+    }
+}
+
+/// Pump the mainloop until `operation` finishes or `PULSE_TIMEOUT` elapses.
 fn run_operation_to_completion<T: ?Sized>(
     mainloop: &mut Mainloop,
     operation: &Operation<T>,
 ) -> Result<()> {
-    loop {
-        match mainloop.iterate(true) {
-            IterateResult::Quit(_) | IterateResult::Err(_) => {
-                return Err(anyhow!("PulseAudio mainloop iteration failed"));
-            }
-            IterateResult::Success(_) => {}
-        }
+    let deadline = Instant::now() + PULSE_TIMEOUT;
 
+    loop {
         match operation.get_state() {
             OperationState::Done => return Ok(()),
             OperationState::Cancelled => {
                 return Err(anyhow!("PulseAudio operation was cancelled"));
             }
-            OperationState::Running => continue,
+            OperationState::Running => {}
+        }
+
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "PulseAudio operation did not complete within {:?}",
+                PULSE_TIMEOUT
+            ));
+        }
+
+        if pump(mainloop, "waiting for an operation to complete")? == 0 {
+            std::thread::sleep(PULSE_POLL_INTERVAL);
         }
     }
 }
 
-/// Connect a fresh context to the default PulseAudio/PipeWire server, blocking
-/// until it's ready. Each call opens (and the caller later drops) its own
-/// connection — unlike ALSA's cached global config, there's no stale-state
-/// problem to work around here, so every call sees the server's current sinks.
+/// Connect a fresh context to the default PulseAudio/PipeWire server, waiting
+/// up to `PULSE_TIMEOUT` for it to become ready. Each call opens (and the caller
+/// later drops) its own connection — unlike ALSA's cached global config, there's
+/// no stale-state problem to work around here, so every call sees the server's
+/// current sinks.
 fn connect() -> Result<(Mainloop, Context)> {
     info!("🔊 pulse_linux::connect: creating mainloop");
     let mut mainloop =
@@ -146,22 +181,9 @@ fn connect() -> Result<(Mainloop, Context)> {
         .map_err(|e| anyhow!("Failed to connect to PulseAudio/PipeWire server: {}", e))?;
 
     info!("🔊 pulse_linux::connect: waiting for context to become Ready");
-    let mut iterations: u32 = 0;
+    let deadline = Instant::now() + PULSE_TIMEOUT;
+
     loop {
-        iterations += 1;
-        if iterations % 50 == 0 {
-            info!("🔊 pulse_linux::connect: still waiting after {} iterations, state={:?}", iterations, context.get_state());
-        }
-
-        match mainloop.iterate(true) {
-            IterateResult::Quit(_) | IterateResult::Err(_) => {
-                return Err(anyhow!(
-                    "PulseAudio mainloop iteration failed while connecting"
-                ));
-            }
-            IterateResult::Success(_) => {}
-        }
-
         match context.get_state() {
             ContextState::Ready => break,
             ContextState::Failed | ContextState::Terminated => {
@@ -171,8 +193,20 @@ fn connect() -> Result<(Mainloop, Context)> {
             }
             _ => {}
         }
+
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "Timed out after {:?} waiting for the PulseAudio/PipeWire server to become ready (last state: {:?})",
+                PULSE_TIMEOUT,
+                context.get_state()
+            ));
+        }
+
+        if pump(&mut mainloop, "connecting")? == 0 {
+            std::thread::sleep(PULSE_POLL_INTERVAL);
+        }
     }
-    info!("🔊 pulse_linux::connect: context Ready after {} iterations", iterations);
+    info!("🔊 pulse_linux::connect: context Ready");
 
     Ok((mainloop, context))
 }
