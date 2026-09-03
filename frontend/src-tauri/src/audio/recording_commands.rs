@@ -1510,6 +1510,47 @@ pub async fn poll_audio_device_events() -> Result<Option<DeviceEventResponse>, S
 
 /// Get current reconnection status
 /// Returns whether the system is attempting to reconnect and which device
+/// The devices the system currently reports as default, named exactly as
+/// `get_audio_devices` lists them so the UI can match them against its options.
+///
+/// `None` for either field means no default is available (no such hardware, or
+/// the audio server could not be reached). Lets a picker offer a real "Default"
+/// entry instead of guessing at the first enumerated device.
+#[derive(Debug, serde::Serialize)]
+pub struct DefaultAudioDevices {
+    pub mic_device: Option<String>,
+    pub system_device: Option<String>,
+}
+
+#[tauri::command]
+pub async fn get_default_audio_devices() -> Result<DefaultAudioDevices, String> {
+    let mic_device = match default_input_device() {
+        Ok(device) => Some(device.name),
+        Err(e) => {
+            warn!("No default microphone available: {}", e);
+            None
+        }
+    };
+
+    let system_device = match default_output_device() {
+        Ok(device) => Some(device.name),
+        Err(e) => {
+            warn!("No default system audio device available: {}", e);
+            None
+        }
+    };
+
+    info!(
+        "🎚️ Default devices — microphone: {:?}, system audio: {:?}",
+        mic_device, system_device
+    );
+
+    Ok(DefaultAudioDevices {
+        mic_device,
+        system_device,
+    })
+}
+
 #[tauri::command]
 pub async fn get_reconnection_status() -> Result<ReconnectionStatus, String> {
     let manager_guard = RECORDING_MANAGER.lock().unwrap();

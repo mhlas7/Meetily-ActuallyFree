@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import {
   deviceDisplayName,
   deviceSelectValue,
+  preferenceForSelection,
+  resolveSelectedDeviceName,
   toDeviceOptionValue,
 } from '../../src/lib/audio-devices';
 
@@ -58,5 +60,42 @@ describe('deviceDisplayName', () => {
 
   test('only strips a trailing suffix, not one mid-name', () => {
     expect(deviceDisplayName('Mic (input) Dock (output)')).toBe('Mic (input) Dock');
+  });
+});
+
+describe('resolveSelectedDeviceName', () => {
+  test('resolves the default sentinel to the reported system default', () => {
+    expect(resolveSelectedDeviceName('default', 'USB Audio Headphones')).toBe('USB Audio Headphones');
+  });
+
+  test('passes an explicitly chosen device through unchanged', () => {
+    expect(resolveSelectedDeviceName('Built-in Mic', 'USB Audio Headphones')).toBe('Built-in Mic');
+  });
+
+  test('yields an empty name when no system default is available', () => {
+    expect(resolveSelectedDeviceName('default', null)).toBe('');
+  });
+
+  test('treats an empty selection as the default', () => {
+    expect(resolveSelectedDeviceName('', 'Built-in Mic')).toBe('Built-in Mic');
+  });
+});
+
+describe('preferenceForSelection', () => {
+  test('stores null for the default sentinel so the backend follows the system default', () => {
+    expect(preferenceForSelection('default', 'Input')).toBeNull();
+  });
+
+  test('stores null for an empty selection', () => {
+    expect(preferenceForSelection('', 'Output')).toBeNull();
+  });
+
+  test('stores an explicit microphone in the same format the settings picker uses', () => {
+    expect(preferenceForSelection('Built-in Mic', 'Input')).toBe('Built-in Mic (input)');
+  });
+
+  test('stores an explicit system device in the same format the settings picker uses', () => {
+    expect(preferenceForSelection('USB Audio Headphones (System Audio)', 'Output'))
+      .toBe('USB Audio Headphones (System Audio) (output)');
   });
 });
