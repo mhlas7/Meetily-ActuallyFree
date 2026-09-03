@@ -16,7 +16,7 @@ use super::capture::CoreAudioCapture;
 use super::recording_state::AudioError;
 
 #[cfg(target_os = "linux")]
-use super::capture::{find_monitor_source_by_description, find_source_by_description, PulseCapture};
+use super::capture::{resolve_monitor_source, resolve_source, PulseCapture};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicBool;
 
@@ -334,7 +334,7 @@ impl AudioStream {
             .unwrap_or(&device.name);
         description = description.strip_suffix(" (output)").unwrap_or(description);
 
-        let monitor_source_name = find_monitor_source_by_description(description)
+        let monitor_source_name = resolve_monitor_source(description)
             .map_err(|e| anyhow::anyhow!("Failed to resolve PulseAudio sink '{}': {}", description, e))?;
 
         let capture_impl = PulseCapture::new_system(&monitor_source_name)
@@ -397,7 +397,7 @@ impl AudioStream {
         // from_name() has already stripped the "(input)" suffix. If the
         // description isn't known (stale saved preference or degraded-mode
         // entry), this errors out and the caller falls back to CPAL.
-        let source_name = find_source_by_description(&device.name)
+        let source_name = resolve_source(&device.name)
             .map_err(|e| anyhow::anyhow!("Failed to resolve PulseAudio source '{}': {}", device.name, e))?;
 
         let capture_impl = PulseCapture::new_microphone(&source_name)
