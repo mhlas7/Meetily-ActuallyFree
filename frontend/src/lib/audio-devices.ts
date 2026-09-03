@@ -14,23 +14,21 @@ export interface AudioDeviceOption {
 export const toDeviceOptionValue = (d: AudioDeviceOption) =>
   `${d.name} (${d.device_type.toLowerCase()})`;
 
-export const UNAVAILABLE_DEVICE_VALUE = '__saved_device__';
-
 /**
  * Value a device <Select> should display for a saved preference.
  *
  * A saved string matching no <SelectItem> makes Radix render a BLANK trigger:
  * the placeholder only shows for '' or undefined, and a stale preference is
- * neither. The component renders a disabled item for UNAVAILABLE_DEVICE_VALUE.
- * Keeping it distinct from 'default' lets an explicit Default selection clear
- * the preference, while merely disconnecting a device never writes it away.
+ * neither. Falling back to the 'default' sentinel keeps the picker readable and
+ * mirrors what the backend already does at record time, where an unresolvable
+ * device falls back to the system default.
  *
  * Display-only on purpose — it never writes, so the saved preference survives a
  * device being temporarily absent and returns when the device does.
  */
 export function deviceSelectValue(saved: string | null, available: string[]): string {
   if (!saved) return 'default';
-  return available.includes(saved) ? saved : UNAVAILABLE_DEVICE_VALUE;
+  return available.includes(saved) ? saved : 'default';
 }
 
 /** "JBL Tune 770NC (System Audio) (output)" -> "JBL Tune 770NC (System Audio)" */
