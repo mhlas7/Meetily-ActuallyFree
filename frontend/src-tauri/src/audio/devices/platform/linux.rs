@@ -58,7 +58,7 @@ pub fn configure_linux_audio(host: &cpal::Host) -> Result<Vec<AudioDevice>> {
                 sources.len()
             );
             for source in sources {
-                devices.push(AudioDevice::new(source.description, DeviceType::Input));
+                devices.push(AudioDevice::new(source.label, DeviceType::Input));
             }
         }
         Err(e) => {
@@ -101,7 +101,7 @@ pub fn configure_linux_audio(host: &cpal::Host) -> Result<Vec<AudioDevice>> {
             );
             for sink in sinks {
                 devices.push(AudioDevice::new(
-                    format!("{} (System Audio)", sink.description),
+                    format!("{} (System Audio)", sink.label),
                     DeviceType::Output,
                 ));
             }

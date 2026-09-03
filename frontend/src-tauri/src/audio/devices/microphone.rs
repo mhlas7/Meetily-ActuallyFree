@@ -12,7 +12,7 @@ use super::configuration::{AudioDevice, DeviceType};
 pub fn default_input_device() -> Result<AudioDevice> {
     #[cfg(target_os = "linux")]
     {
-        match crate::audio::capture::default_source_description() {
+        match crate::audio::capture::default_source_label() {
             Ok(Some(description)) => {
                 return Ok(AudioDevice::new(description, DeviceType::Input));
             }

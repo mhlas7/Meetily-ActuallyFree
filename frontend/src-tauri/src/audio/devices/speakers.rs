@@ -48,7 +48,7 @@ pub fn default_output_device() -> Result<AudioDevice> {
             .next()
             .ok_or_else(|| anyhow!("No PulseAudio/PipeWire sink found"))?;
         return Ok(AudioDevice::new(
-            format!("{} (System Audio)", sink.description),
+            format!("{} (System Audio)", sink.label),
             DeviceType::Output,
         ));
     }

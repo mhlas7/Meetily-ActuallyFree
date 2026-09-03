@@ -171,7 +171,7 @@ pub async fn get_device_and_config(
                             .unwrap_or(&audio_device.name);
 
                         // Check if this sink exists in PulseAudio
-                        match pulse_linux::find_monitor_source_by_description(sink_desc) {
+                        match pulse_linux::resolve_monitor_source(sink_desc) {
                             Ok(_monitor_source) => {
                                 // Device exists! Return a dummy CPAL device since the actual
                                 // stream creation in stream.rs will use PulseCapture directly
