@@ -3659,7 +3659,7 @@ dependencies = [
 
 [[package]]
 name = "meetily"
-version = "0.2.12"
+version = "0.2.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3733,6 +3733,7 @@ dependencies = [
  "whatlang",
  "which 6.0.3",
  "whisper-rs",
+ "windows 0.54.0",
  "windows-sys 0.59.0",
  "winreg 0.55.0",
  "xz2",
@@ -6984,8 +6985,6 @@ dependencies = [
 [[package]]
 name = "tauri-runtime-wry"
 version = "2.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e6fac707727b7a2f48e4ded90976324267371073edbb415ffb73bb0458d203f"
 dependencies = [
  "gtk",
  "http 1.4.0",
@@ -7000,6 +6999,7 @@ dependencies = [
  "tao",
  "tauri-runtime",
  "tauri-utils",
+ "tracing",
  "url",
  "webkit2gtk",
  "webview2-com",
@@ -8913,6 +8913,7 @@ dependencies = [
  "soup3",
  "tao-macros",
  "thiserror 2.0.18",
+ "tracing",
  "url",
  "webkit2gtk",
  "webkit2gtk-sys",

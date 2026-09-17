@@ -250,6 +250,7 @@ const Sidebar: React.FC = () => {
         whisperModel: config.whisperModel,
         apiKey: config.apiKey,
         ollamaEndpoint: config.ollamaEndpoint,
+        summaryMaxTokens: config.summaryMaxTokens ?? null,
       });
 
       setModelConfig(config);

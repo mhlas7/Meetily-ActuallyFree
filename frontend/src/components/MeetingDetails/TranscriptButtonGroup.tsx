@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useCallback, useEffect } from 'react';
-import { Button } from '@/components/ui/button';
+import { ToolbarButton as Button } from './ToolbarButton';
 import { ButtonGroup } from '@/components/ui/button-group';
 import { Copy, Download, FolderOpen, RefreshCw, Users, Loader2 } from 'lucide-react';
 import Analytics from '@/lib/analytics';
@@ -105,8 +105,8 @@ export function TranscriptButtonGroup({
   }, [meetingId, isDiarizing, onRefetchTranscripts]);
 
   return (
-    <div className="flex w-max min-w-full shrink-0 items-center justify-end">
-      <ButtonGroup className="shrink-0">
+    <div className="flex w-full min-w-0 items-center justify-end">
+      <ButtonGroup className="meeting-toolbar-group justify-end">
         <Button
           variant="outline"
           size="sm"

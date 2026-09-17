@@ -136,12 +136,12 @@ export function TranscriptPanel({
 
       {/* The action container owns its responsive breakpoint, since this column
           can be narrow even when the overall window is wide. */}
-      <div className="mt-4 flex min-w-0 items-center gap-2 border-b border-[var(--af-border)] px-4 sm:mt-5 sm:gap-3 sm:px-6 lg:px-8">
+      <div className="mt-4 flex min-w-0 shrink-0 flex-wrap items-center gap-2 border-b border-[var(--af-border)] px-4 sm:mt-5 sm:gap-3 sm:px-6 lg:px-8">
         <span className="relative -mb-px shrink-0 py-2 text-sm font-medium text-[var(--af-accent)]">
           Transcript
           <span className="absolute inset-x-0 -bottom-px h-0.5 rounded-full bg-[var(--af-accent)]" />
         </span>
-        <div className="transcript-actions-container ml-auto min-w-0 flex-1 overflow-x-auto overscroll-x-contain py-1 no-scrollbar">
+        <div className="transcript-actions-container ml-auto min-w-0 flex-[1_1_190px] py-1">
           <TranscriptButtonGroup
             transcriptCount={usePagination ? (totalCount ?? convertedSegments.length) : (transcripts?.length || 0)}
             onCopyTranscript={onCopyTranscript}

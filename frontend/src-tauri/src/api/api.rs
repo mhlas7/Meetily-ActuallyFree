@@ -82,6 +82,8 @@ pub struct ModelConfig {
     pub api_key: Option<String>,
     #[serde(rename = "ollamaEndpoint")]
     pub ollama_endpoint: Option<String>,
+    #[serde(rename = "summaryMaxTokens")]
+    pub summary_max_tokens: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -545,6 +547,7 @@ pub async fn api_get_model_config<R: Runtime>(
                         whisper_model: config.whisper_model,
                         api_key,
                         ollama_endpoint: config.ollama_endpoint,
+                        summary_max_tokens: config.summary_max_tokens,
                     }))
                 }
                 Err(e) => {
@@ -577,16 +580,24 @@ pub async fn api_save_model_config<R: Runtime>(
     whisper_model: String,
     api_key: Option<String>,
     ollama_endpoint: Option<String>,
+    summary_max_tokens: Option<i64>,
     _auth_token: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_info!(
-        "💾 api_save_model_config called (native): provider='{}', model='{}', whisperModel='{}', ollamaEndpoint={:?}",
+        "💾 api_save_model_config called (native): provider='{}', model='{}', whisperModel='{}', ollamaEndpoint={:?}, summaryMaxTokens={:?}",
         &provider,
         &model,
         &whisper_model,
-        &ollama_endpoint
+        &ollama_endpoint,
+        &summary_max_tokens
     );
     let pool = state.db_manager.pool();
+
+    if provider.eq_ignore_ascii_case("claude") {
+        crate::summary::llm_client::claude_max_tokens(&model, summary_max_tokens)?;
+    } else if summary_max_tokens.is_some_and(|tokens| tokens < 1 || tokens > 64000) {
+        return Err("Maximum summary length must be between 1 and 64000, or left empty".into());
+    }
 
     if let Err(e) = SettingsRepository::save_model_config(
         pool,
@@ -594,6 +605,7 @@ pub async fn api_save_model_config<R: Runtime>(
         &model,
         &whisper_model,
         ollama_endpoint.as_deref(),
+        summary_max_tokens,
     )
     .await
     {

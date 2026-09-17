@@ -1,6 +1,7 @@
 param(
   [string]$VulkanSdk,
   [string]$LlvmDir,
+  [string]$CudaToolkit,
   [switch]$SkipFrontend,
   [switch]$AllowUnsigned,
   [string]$UpdaterPrivateKeyPath,
@@ -198,7 +199,7 @@ $env:Vulkan_INCLUDE_DIR = Join-Path $VulkanSdk "Include"
 $env:PATH = "$(Join-Path $VulkanSdk 'Bin');$env:PATH"
 $vulkanBinary = Build-Variant "Vulkan" $vulkanTarget @("vulkan")
 
-$env:CUDA_PATH = Join-Path $repo ".cuda_toolkit"
+$env:CUDA_PATH = if ($CudaToolkit) { [System.IO.Path]::GetFullPath($CudaToolkit) } else { Join-Path $repo ".cuda_toolkit" }
 $env:CUDA_TOOLKIT_ROOT_DIR = $env:CUDA_PATH
 $nvcc = Join-Path $env:CUDA_PATH "bin\nvcc.exe"
 if (-not (Test-Path $nvcc)) {
@@ -224,7 +225,9 @@ Copy-Item $vulkanProbeBinary (Join-Path $variants "meetily-vulkan-probe.exe") -F
 
 & (Join-Path $PSScriptRoot "stage-runtime-deps.ps1") -BuildOutput @(
   (Join-Path $cpuTarget "release"),
-  (Join-Path $cudaTarget "release")
+  (Join-Path $cudaTarget "release"),
+  (Join-Path $env:CUDA_PATH "bin\x64"),
+  (Join-Path $env:CUDA_PATH "bin")
 )
 
 foreach ($binary in Get-ChildItem $variants -Filter "*.exe") {
@@ -289,7 +292,7 @@ if ($LASTEXITCODE -ne 0) { throw "Frameless installer signing failed" }
 $signature = (Get-Content $updaterSignatureOutput -Raw).Trim()
 $latest = [ordered]@{
   version = $appVersion
-  notes = "Preserves user-renamed meetings, restores summary template and model controls, synchronizes meeting titles, and anchors meeting and transcript times to the recording start."
+  notes = "Maintenance release: accessible meeting toolbars in narrow panels, readable disconnected-device pickers and dark-mode controls, configurable Claude summary output budgets with truncation detection, and clean source-build resources. Includes the full Windows runtime crash fix from v0.2.14."
   pub_date = [DateTime]::UtcNow.ToString("o")
   platforms = [ordered]@{
     "windows-x86_64" = [ordered]@{

@@ -8,7 +8,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { VisuallyHidden } from "@/components/ui/visually-hidden"
-import { Button } from '@/components/ui/button';
+import { ToolbarButton as Button } from './ToolbarButton';
 import { ButtonGroup } from '@/components/ui/button-group';
 import {
   DropdownMenu,
@@ -21,7 +21,6 @@ import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { useState, useEffect, useRef, ReactNode } from 'react';
-import { isOllamaNotInstalledError } from '@/lib/utils';
 import { BuiltInModelInfo } from '@/lib/builtin-ai';
 
 interface SummaryGeneratorButtonGroupProps {
@@ -207,57 +206,9 @@ export function SummaryGeneratorButtonGroup({
       return;
     }
 
-    // Only check for Ollama provider
-    if (modelConfig.provider !== 'ollama') {
-      onGenerateSummary(effectivePrompt);
-      return;
-    }
-
-    setIsCheckingModels(true);
-    try {
-      const endpoint = modelConfig.ollamaEndpoint || null;
-      const models = await invoke('get_ollama_models', { endpoint }) as any[];
-
-      if (!models || models.length === 0) {
-        // No models available, show message and open settings
-        toast.error(
-          'No Ollama models found. Please download gemma2:2b from Model Settings.',
-          { duration: 5000 }
-        );
-        setSettingsDialogOpen(true);
-        return;
-      }
-
-      // Models are available, proceed with generation
-      onGenerateSummary(effectivePrompt);
-    } catch (error) {
-      console.error('Error checking Ollama models:', error);
-      const errorMessage = error instanceof Error ? error.message : String(error);
-
-      if (isOllamaNotInstalledError(errorMessage)) {
-        // Ollama is not installed - show specific message with download link
-        toast.error(
-          'Ollama is not installed',
-          {
-            description: 'Please download and install Ollama to use local models.',
-            duration: 7000,
-            action: {
-              label: 'Download',
-              onClick: () => invoke('open_external_url', { url: 'https://ollama.com/download' })
-            }
-          }
-        );
-      } else {
-        // Other error - generic message
-        toast.error(
-          'Failed to check Ollama models. Please check if Ollama is running and download a model.',
-          { duration: 5000 }
-        );
-      }
-      setSettingsDialogOpen(true);
-    } finally {
-      setIsCheckingModels(false);
-    }
+    // The generation hook owns provider validation so manual and automatic
+    // summaries share cancellation, persistent errors, and settings recovery.
+    await onGenerateSummary(effectivePrompt);
   };
 
   const isGenerating = summaryStatus === 'processing' || summaryStatus === 'summarizing' || summaryStatus === 'regenerating';
@@ -295,7 +246,7 @@ export function SummaryGeneratorButtonGroup({
   ];
 
   return (
-    <ButtonGroup>
+    <ButtonGroup className="meeting-toolbar-group">
       {/* Generate Summary or Stop button */}
       {isGenerating ? (
         <Button
@@ -310,7 +261,7 @@ export function SummaryGeneratorButtonGroup({
           aria-label="Stop summary generation"
         >
           <Square className="xl:mr-2" size={18} fill="currentColor" />
-          <span className="hidden lg:inline xl:inline">Stop</span>
+           <span className="summary-action-label summary-primary-label">Stop</span>
         </Button>
       ) : (
         <Button
@@ -331,12 +282,12 @@ export function SummaryGeneratorButtonGroup({
           {isCheckingModels || isModelConfigLoading ? (
             <>
               <Loader2 className="animate-spin xl:mr-2" size={18} />
-              <span className="hidden xl:inline">Processing...</span>
+              <span className="summary-action-label summary-primary-label">Processing...</span>
             </>
           ) : (
             <>
               <Sparkles className="xl:mr-2" size={18} />
-              <span className="hidden lg:inline xl:inline">{hasSummary ? 'Regenerate Summary' : 'Generate Summary'}</span>
+              <span className="summary-action-label summary-primary-label">{hasSummary ? 'Regenerate Summary' : 'Generate Summary'}</span>
             </>
           )}
         </Button>
@@ -354,7 +305,7 @@ export function SummaryGeneratorButtonGroup({
             aria-label="Summary Settings"
           >
             <Settings />
-            <span className="hidden lg:inline">AI Model</span>
+            <span className="summary-action-label">AI Model</span>
           </Button>
         </DialogTrigger>
         <DialogContent
@@ -387,7 +338,7 @@ export function SummaryGeneratorButtonGroup({
               aria-label="Select summary template"
             >
               <FileText />
-              <span className="hidden lg:inline">Template</span>
+              <span className="summary-action-label">Template</span>
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">

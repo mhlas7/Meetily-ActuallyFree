@@ -8,7 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Label } from '@/components/ui/label';
 import Analytics from '@/lib/analytics';
 import { usePlatform } from '@/hooks/usePlatform';
-import { toDeviceOptionValue, deviceSelectValue, deviceDisplayName } from '@/lib/audio-devices';
+import { toDeviceOptionValue, deviceSelectValue, deviceDisplayName, UNAVAILABLE_DEVICE_VALUE } from '@/lib/audio-devices';
 
 export interface AudioDevice {
   name: string;
@@ -305,6 +305,11 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="default">Default Microphone</SelectItem>
+              {selectedDevices.micDevice && !micOptions.includes(selectedDevices.micDevice) && (
+                <SelectItem value={UNAVAILABLE_DEVICE_VALUE} disabled>
+                  {deviceDisplayName(selectedDevices.micDevice)} ({micFellBack ? 'unavailable' : 'saved device'})
+                </SelectItem>
+              )}
               {inputDevices.map((device) => (
                 <SelectItem
                   key={device.name}
@@ -319,9 +324,9 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
             <p className="text-xs text-gray-500">No microphone devices found</p>
           )}
           {micFellBack && (
-            <p className="text-xs text-amber-600">
+            <p className=”text-xs text-amber-600”>
               “{deviceDisplayName(selectedDevices.micDevice!)}” isn’t available right now — using
-              the default microphone. It’ll be restored when the device reconnects.
+              the default microphone for new recordings. Refresh after reconnecting, or select Default Microphone to clear this preference.
             </p>
           )}
 
@@ -380,6 +385,11 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="default">Default System Audio</SelectItem>
+              {!isMacOS && selectedDevices.systemDevice && !systemOptions.includes(selectedDevices.systemDevice) && (
+                <SelectItem value={UNAVAILABLE_DEVICE_VALUE} disabled>
+                  {deviceDisplayName(selectedDevices.systemDevice)} ({systemFellBack ? 'unavailable' : 'saved device'})
+                </SelectItem>
+              )}
               {!isMacOS && outputDevices.map((device) => (
                 <SelectItem
                   key={device.name}
@@ -395,14 +405,19 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
             <p className="text-xs text-gray-500">No system audio devices found</p>
           )}
           {systemFellBack && (
-            <p className="text-xs text-amber-600">
+            <p className=”text-xs text-amber-600”>
               “{deviceDisplayName(selectedDevices.systemDevice!)}” isn’t available right now — using
-              the system default. It’ll be restored when the device reconnects.
+              the system default for new recordings. Refresh after reconnecting, or select Default System Audio to clear this preference.
             </p>
           )}
           {isMacOS && outputDevices.length > 0 && (
             <p className="text-xs text-gray-500">
               macOS captures the current default output. Change the route in System Settings.
+            </p>
+          )}
+          {!isMacOS && outputDevices.length > 0 && (
+            <p className="text-xs text-gray-500">
+              Zoom and similar apps can use their own speaker. Set the app&apos;s Speaker to the same output selected here.
             </p>
           )}
 

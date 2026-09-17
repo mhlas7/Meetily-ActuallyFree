@@ -442,6 +442,29 @@ impl SummaryService {
             api_key
         };
 
+        // Resolve the actual Claude budget BEFORE caching, including defaults.
+        // A saved Claude preference must never change another provider's request.
+        let final_max_tokens = if provider == LLMProvider::Claude {
+            let configured = match SettingsRepository::get_summary_max_tokens(&pool).await {
+                Ok(value) => value,
+                Err(error) => {
+                    Self::update_process_failed(&pool, &meeting_id, &format!("Could not read summary output limit: {error}")).await;
+                    return;
+                }
+            };
+            match super::llm_client::claude_max_tokens(&model_name, configured) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    Self::update_process_failed(&pool, &meeting_id, &error).await;
+                    return;
+                }
+            }
+        } else if provider == LLMProvider::CustomOpenAI {
+            custom_openai_max_tokens
+        } else {
+            None
+        };
+
         // Dynamically fetch context size based on provider and model
         let token_threshold = if provider == LLMProvider::Ollama {
             match METADATA_CACHE.get_or_fetch(&model_name, ollama_endpoint.as_deref()).await {
@@ -524,7 +547,7 @@ impl SummaryService {
             &model_name,
             ollama_endpoint.as_deref(),
             custom_openai_endpoint.as_deref(),
-            custom_openai_max_tokens,
+            final_max_tokens,
             custom_openai_temperature,
             custom_openai_top_p,
         );
@@ -575,7 +598,7 @@ impl SummaryService {
             token_threshold,
             ollama_endpoint.as_deref(),
             custom_openai_endpoint.as_deref(),
-            custom_openai_max_tokens,
+            final_max_tokens,
             custom_openai_temperature,
             custom_openai_top_p,
             app_data_dir.as_ref(),

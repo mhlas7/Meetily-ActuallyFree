@@ -29,6 +29,7 @@ import {
 } from '@/components/ui/command';
 import { cn, isOllamaNotInstalledError } from '@/lib/utils';
 import { toast } from 'sonner';
+import { claudeOutputBudget, parseClaudeOutputTokens } from '@/lib/claude-output-tokens';
 
 export interface ModelConfig {
   provider: 'ollama' | 'groq' | 'claude' | 'openai' | 'openrouter' | 'builtin-ai' | 'custom-openai';
@@ -36,6 +37,8 @@ export interface ModelConfig {
   whisperModel: string;
   apiKey?: string | null;
   ollamaEndpoint?: string | null;
+  /** Cap on summary output length; null uses the provider default */
+  summaryMaxTokens?: number | null;
   // Custom OpenAI fields
   customOpenAIEndpoint?: string | null;
   customOpenAIModel?: string | null;
@@ -154,6 +157,11 @@ export function ModelSettingsModal({
   const [customTopP, setCustomTopP] = useState<string>(modelConfig.topP?.toString() || '');
   const [isCustomOpenAIAdvancedOpen, setIsCustomOpenAIAdvancedOpen] = useState<boolean>(false);
   const [isTestingConnection, setIsTestingConnection] = useState<boolean>(false);
+
+  // Summary output cap, kept as a string so the field can be emptied
+  const [summaryMaxTokens, setSummaryMaxTokens] = useState<string>(
+    modelConfig.summaryMaxTokens?.toString() || ''
+  );
 
   // Combobox state
   const [modelComboboxOpen, setModelComboboxOpen] = useState<boolean>(false);
@@ -412,6 +420,12 @@ export function ModelSettingsModal({
     }
   }, [modelConfig.provider, providerApiKeys, requiresApiKey]);
 
+  // Adopt an output cap that arrived from the parent (skipInitialFetch callers
+  // own the fetch, so the field would otherwise stay on its initial value).
+  useEffect(() => {
+    setSummaryMaxTokens(modelConfig.summaryMaxTokens?.toString() ?? '');
+  }, [modelConfig.summaryMaxTokens]);
+
   // Manual fetch function for Ollama models
   const fetchOllamaModels = async (silent = false) => {
     const trimmedEndpoint = ollamaEndpoint.trim();
@@ -615,6 +629,15 @@ export function ModelSettingsModal({
   }, [models, openRouterModels, builtinAiModels, openaiModels, claudeModels, groqModels, modelConfig.provider]);
 
   const handleSave = async () => {
+    let outputTokens = modelConfig.summaryMaxTokens ?? null;
+    if (modelConfig.provider === 'claude') {
+      try {
+        outputTokens = parseClaudeOutputTokens(summaryMaxTokens, modelConfig.model);
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : String(error));
+        return;
+      }
+    }
     // For custom-openai provider, save the custom config first
     if (modelConfig.provider === 'custom-openai') {
       try {
@@ -640,6 +663,7 @@ export function ModelSettingsModal({
       ollamaEndpoint: modelConfig.provider === 'ollama'
         ? (ollamaEndpoint.trim() || null)
         : (modelConfig.ollamaEndpoint || null),
+      summaryMaxTokens: outputTokens,
       // Include custom OpenAI fields
       customOpenAIEndpoint: modelConfig.provider === 'custom-openai' ? customOpenAIEndpoint.trim() : null,
       customOpenAIModel: modelConfig.provider === 'custom-openai' ? customOpenAIModel.trim() : null,
@@ -1111,6 +1135,31 @@ export function ModelSettingsModal({
                 </Button>
               </div>
             </div>
+          </div>
+        )}
+
+        {/* The Anthropic API requires max_tokens, so Claude is the one provider
+            where this value always has an effect. Everything else either has its
+            own field (Custom Server) or uses its own default. */}
+        {modelConfig.provider === 'claude' && (
+          <div>
+            <Label htmlFor="summary-max-tokens">Maximum summary length (optional)</Label>
+            <Input
+              id="summary-max-tokens"
+              type="number"
+              min="1"
+              max={claudeOutputBudget(modelConfig.model).maximum}
+              step="1"
+              value={summaryMaxTokens}
+              onChange={(e) => setSummaryMaxTokens(e.target.value)}
+              placeholder={String(claudeOutputBudget(modelConfig.model).defaultTokens)}
+              className="mt-1"
+            />
+            <p className="text-xs text-muted-foreground mt-1">
+              Leave empty for the app default of {claudeOutputBudget(modelConfig.model).defaultTokens.toLocaleString()} output tokens.
+              You can choose up to {claudeOutputBudget(modelConfig.model).maximum.toLocaleString()} for this model.
+              A higher limit allows longer summaries and may increase API usage. Incomplete responses are reported as errors.
+            </p>
           </div>
         )}
 

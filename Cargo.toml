@@ -2,6 +2,12 @@
 resolver = "2"
 members = [
     "frontend/src-tauri",
+    "llama-helper",
+    "vendor/tauri-runtime-wry"
+]
+# Keep normal workspace builds unchanged; allow package-only runtime feature tests.
+default-members = [
+    "frontend/src-tauri",
     "llama-helper"
 ]
 
@@ -16,3 +22,6 @@ anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.32.0", features = ["full"] }
+
+[patch.crates-io]
+tauri-runtime-wry = { path = "vendor/tauri-runtime-wry" }

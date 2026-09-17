@@ -20,10 +20,11 @@ This fork also goes beyond removing feature restrictions. It adds speaker identi
 
 ## Latest Release
 
-Meetily `v0.2.12` preserves user-renamed meetings during summary generation,
-restores summary template and model controls, synchronizes meeting titles, and
-anchors meeting and transcript times to the actual recording start.
-[Read the v0.2.12 changelog](CHANGELOG.md).
+Meetily `v0.2.15` keeps meeting controls accessible in narrow panels, fixes
+disconnected-device pickers and native dark-mode controls, and adds configurable
+Claude summary output budgets with explicit truncation errors. It retains the
+Windows long-recording crash fix from v0.2.14.
+[Read the v0.2.15 changelog](CHANGELOG.md).
 
 ## Feature Comparison
 

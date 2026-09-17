@@ -18,6 +18,8 @@ export interface ModelConfig {
    */
   apiKey?: string | null;
   ollamaEndpoint?: string | null;
+  /** Cap on summary output length; null uses the provider default */
+  summaryMaxTokens?: number | null;
   // Custom OpenAI fields (only populated when provider is 'custom-openai')
   customOpenAIEndpoint?: string | null;
   customOpenAIModel?: string | null;

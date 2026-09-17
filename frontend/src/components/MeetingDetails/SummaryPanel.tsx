@@ -23,8 +23,8 @@ import { SummaryUpdaterButtonGroup } from './SummaryUpdaterButtonGroup';
 import { InsightTabs } from './InsightTabs';
 import { useEffect, useRef, useState, RefObject } from 'react';
 import { toast } from 'sonner';
-import { Languages, ChevronDown } from 'lucide-react';
-import { Button } from '@/components/ui/button';
+import { Languages, ChevronDown, AlertCircle } from 'lucide-react';
+import { ToolbarButton as Button } from './ToolbarButton';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { LanguagePickerPopover } from '@/components/LanguagePickerPopover';
 import { useRecentLanguages } from '@/hooks/useRecentLanguages';
@@ -253,7 +253,7 @@ export function SummaryPanel({
           aria-label="Set summary language"
         >
           <Languages size={18} />
-          <span className="hidden lg:inline">{effectiveLangLabel}</span>
+          <span className="summary-action-label">{effectiveLangLabel}</span>
           <ChevronDown size={14} className="text-gray-400" />
         </Button>
       </PopoverTrigger>
@@ -272,9 +272,9 @@ export function SummaryPanel({
   );
 
   return (
-    <div className="flex min-h-0 min-w-0 w-full flex-[1.15] flex-col overflow-hidden border-t border-[var(--af-border)] bg-[var(--af-bg)] md:min-w-[280px] md:border-l md:border-t-0 lg:max-w-[960px]">
-      <div className="flex min-h-12 items-center gap-2 overflow-x-auto border-b border-[var(--af-border)] bg-[var(--af-panel)] px-3 py-2">
-        <div className="flex-shrink-0">
+    <div className="summary-actions-container flex min-h-0 min-w-0 w-full flex-[1.15] flex-col overflow-hidden border-t border-[var(--af-border)] bg-[var(--af-bg)] md:min-w-[280px] md:border-l md:border-t-0 lg:max-w-[960px]">
+      <div className="summary-toolbar flex min-h-12 shrink-0 flex-wrap items-center gap-2 border-b border-[var(--af-border)] bg-[var(--af-panel)] px-3 py-2">
+        <div className="min-w-0 max-w-full">
           <SummaryGeneratorButtonGroup
             modelConfig={modelConfig}
             setModelConfig={setModelConfig}
@@ -297,7 +297,7 @@ export function SummaryPanel({
         </div>
 
         {aiSummary && (
-          <div className="ml-auto flex-shrink-0">
+          <div className="ml-auto min-w-0 max-w-full">
             <SummaryUpdaterButtonGroup
               isSaving={isSaving}
               isDirty={isTitleDirty || (summaryRef.current?.isDirty || false)}
@@ -314,6 +314,34 @@ export function SummaryPanel({
           </div>
         )}
       </div>
+
+      {summaryError && !isSummaryLoading && (
+        <div
+          role="alert"
+          className="mx-3 mt-3 flex items-start gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900 dark:border-red-900/70 dark:bg-red-950/40 dark:text-red-100"
+        >
+          <AlertCircle className="mt-0.5 h-4 w-4 flex-none" aria-hidden="true" />
+          <div className="min-w-0 flex-1">
+            <p className="font-medium">Summary generation failed</p>
+            <p className="mt-0.5 break-words text-red-700 dark:text-red-200">{summaryError}</p>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="flex-none border-red-300 bg-white hover:bg-red-100 dark:border-red-800 dark:bg-red-950 dark:hover:bg-red-900"
+            onClick={() => {
+              if (aiSummary) {
+                onRequestRegenerate();
+              } else {
+                void onGenerateSummary(customPrompt);
+              }
+            }}
+          >
+            Try again
+          </Button>
+        </div>
+      )}
 
       {/* The insight surface is shown for every meeting and fills the area next
           to the transcript column. Summary actions live in the toolbar above. */}

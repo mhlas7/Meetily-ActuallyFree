@@ -44,27 +44,42 @@ impl SettingsRepository {
         model: &str,
         whisper_model: &str,
         ollama_endpoint: Option<&str>,
+        summary_max_tokens: Option<i64>,
     ) -> std::result::Result<(), sqlx::Error> {
         // Using id '1' for backward compatibility
         sqlx::query(
             r#"
-            INSERT INTO settings (id, provider, model, whisperModel, ollamaEndpoint)
-            VALUES ('1', $1, $2, $3, $4)
+            INSERT INTO settings (id, provider, model, whisperModel, ollamaEndpoint, summaryMaxTokens)
+            VALUES ('1', $1, $2, $3, $4, $5)
             ON CONFLICT(id) DO UPDATE SET
                 provider = excluded.provider,
                 model = excluded.model,
                 whisperModel = excluded.whisperModel,
-                ollamaEndpoint = excluded.ollamaEndpoint
+                ollamaEndpoint = excluded.ollamaEndpoint,
+                summaryMaxTokens = excluded.summaryMaxTokens
             "#,
         )
         .bind(provider)
         .bind(model)
         .bind(whisper_model)
         .bind(ollama_endpoint)
+        .bind(summary_max_tokens)
         .execute(pool)
         .await?;
 
         Ok(())
+    }
+
+    /// Read the configured cap on summary output length.
+    /// `None` means "use the provider default".
+    pub async fn get_summary_max_tokens(
+        pool: &SqlitePool,
+    ) -> std::result::Result<Option<i64>, sqlx::Error> {
+        let value: Option<Option<i64>> =
+            sqlx::query_scalar("SELECT summaryMaxTokens FROM settings WHERE id = '1' LIMIT 1")
+                .fetch_optional(pool)
+                .await?;
+        Ok(value.flatten())
     }
 
     pub async fn save_api_key(

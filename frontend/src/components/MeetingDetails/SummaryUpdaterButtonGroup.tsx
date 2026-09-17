@@ -1,6 +1,6 @@
 "use client";
 
-import { Button } from '@/components/ui/button';
+import { ToolbarButton as Button } from './ToolbarButton';
 import { ButtonGroup } from '@/components/ui/button-group';
 import { Copy, Save, Loader2, Search, FolderOpen, Download } from 'lucide-react';
 import Analytics from '@/lib/analytics';
@@ -27,7 +27,7 @@ export function SummaryUpdaterButtonGroup({
   hasSummary
 }: SummaryUpdaterButtonGroupProps) {
   return (
-    <ButtonGroup>
+    <ButtonGroup className="meeting-toolbar-group">
       {/* Save button */}
       <Button
         variant="outline"
@@ -43,12 +43,12 @@ export function SummaryUpdaterButtonGroup({
         {isSaving ? (
           <>
             <Loader2 className="animate-spin" />
-            <span className="hidden lg:inline">Saving...</span>
+            <span className="summary-action-label">Saving...</span>
           </>
         ) : (
           <>
             <Save />
-            <span className="hidden lg:inline">Save</span>
+            <span className="summary-action-label">Save</span>
           </>
         )}
       </Button>
@@ -66,7 +66,7 @@ export function SummaryUpdaterButtonGroup({
         className="cursor-pointer"
       >
         <Copy />
-        <span className="hidden lg:inline">Copy</span>
+        <span className="summary-action-label">Copy</span>
       </Button>
 
       {/* Meeting export flow */}
@@ -82,7 +82,7 @@ export function SummaryUpdaterButtonGroup({
           className="cursor-pointer"
         >
           <Download />
-          <span className="hidden lg:inline">Export</span>
+          <span className="summary-action-label">Export</span>
         </Button>
       )}
 

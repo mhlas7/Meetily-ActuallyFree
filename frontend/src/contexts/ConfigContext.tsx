@@ -283,6 +283,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
             model: data.model || prev.model,
             whisperModel: data.whisperModel || prev.whisperModel,
             ollamaEndpoint: data.ollamaEndpoint,
+            summaryMaxTokens: data.summaryMaxTokens ?? null,
           }));
 
           // Seed per-provider model cache from DB

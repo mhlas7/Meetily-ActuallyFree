@@ -43,6 +43,42 @@ pub struct MessageContent {
     pub content: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeOutputLimits {
+    default_tokens: u32,
+    fallback_limit: u32,
+    application_limit: u32,
+    models: Vec<ClaudeModelLimit>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeModelLimit {
+    prefix: String,
+    limit: u32,
+}
+
+// One versioned catalog serves the settings UI and request validation. Limits
+// are conservative application budgets, not the model's advertised maximum.
+static CLAUDE_OUTPUT_LIMITS: std::sync::LazyLock<ClaudeOutputLimits> = std::sync::LazyLock::new(|| {
+    serde_json::from_str(include_str!("../../../src/lib/claude-output-limits.json"))
+        .expect("bundled Claude output limits must be valid")
+});
+
+pub fn claude_max_tokens(model_name: &str, configured: Option<i64>) -> Result<u32, String> {
+    let limits = &*CLAUDE_OUTPUT_LIMITS;
+    let model = model_name.to_lowercase();
+    let maximum = limits.application_limit.min(limits.models.iter().find(|entry| {
+        model == entry.prefix || model.starts_with(&format!("{}{}", entry.prefix,
+            if entry.prefix.ends_with('-') { "" } else { "-" }))
+    }).map(|entry| entry.limit).unwrap_or(limits.fallback_limit));
+    match configured {
+        None => Ok(limits.default_tokens.min(maximum)),
+        Some(value) if value > 0 && value <= i64::from(maximum) => Ok(value as u32),
+        Some(_) => Err(format!("Maximum Claude summary length must be between 1 and {maximum} tokens for {model_name}, or left empty.")),
+    }
+}
+
 // Claude-specific request structure
 #[derive(Debug, Serialize)]
 pub struct ClaudeRequest {
@@ -56,11 +92,33 @@ pub struct ClaudeRequest {
 #[derive(Deserialize, Debug)]
 pub struct ClaudeChatResponse {
     pub content: Vec<ClaudeChatContent>,
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
-pub struct ClaudeChatContent {
-    pub text: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClaudeChatContent {
+    Text { text: String },
+    #[serde(other)]
+    Other,
+}
+
+impl ClaudeChatResponse {
+    fn complete_text(self) -> Result<String, String> {
+        match self.stop_reason.as_deref() {
+            Some("end_turn" | "stop_sequence") => {},
+            Some("max_tokens") => return Err("Claude reached the output limit before completing the summary. Increase Maximum summary length in Model Settings or request a shorter summary, then retry. The incomplete result was not saved.".into()),
+            Some(reason) => return Err(format!("Claude did not complete the response (stop reason: {reason}). Please retry.")),
+            None => return Err("Claude response did not include a completion reason; incomplete output was not accepted.".into()),
+        }
+        let text = self.content.into_iter().filter_map(|block| match block {
+            ClaudeChatContent::Text { text } => Some(text),
+            ClaudeChatContent::Other => None,
+        }).collect::<Vec<_>>().join("\n");
+        let text = text.trim();
+        if text.is_empty() { return Err("No text in Claude response".into()); }
+        Ok(text.to_string())
+    }
 }
 
 /// LLM Provider enumeration for multi-provider support
@@ -102,7 +160,8 @@ impl LLMProvider {
 /// * `user_prompt` - User query/content to process
 /// * `ollama_endpoint` - Optional custom Ollama endpoint (defaults to localhost:11434)
 /// * `custom_openai_endpoint` - Optional custom OpenAI-compatible endpoint
-/// * `max_tokens` - Optional max tokens (for CustomOpenAI provider)
+/// * `max_tokens` - Optional output-token cap (Claude and CustomOpenAI; other
+///   OpenAI-compatible providers keep their own defaults)
 /// * `temperature` - Optional temperature (for CustomOpenAI provider)
 /// * `top_p` - Optional top_p (for CustomOpenAI provider)
 /// * `app_data_dir` - Optional app data directory (for BuiltInAI provider)
@@ -245,7 +304,7 @@ pub async fn generate_summary(
         serde_json::json!(ClaudeRequest {
             system: system_prompt.to_string(),
             model: model_name.to_string(),
-            max_tokens: 2048,
+            max_tokens: claude_max_tokens(model_name, max_tokens.map(i64::from))?,
             messages: vec![ChatMessage {
                 role: "user".to_string(),
                 content: user_prompt.to_string(),
@@ -299,20 +358,20 @@ pub async fn generate_summary(
 
     // Parse response based on provider
     if provider == &LLMProvider::Claude {
-        let chat_response = response
-            .json::<ClaudeChatResponse>()
-            .await
-            .map_err(|e| format!("Failed to parse LLM response: {}", e))?;
+        let body = response.json::<ClaudeChatResponse>();
+        let chat_response = if let Some(token) = cancellation_token {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => return Err("Summary generation was cancelled".into()),
+                result = body => result,
+            }
+        } else {
+            body.await
+        }.map_err(|e| format!("Failed to parse LLM response: {e}"))?;
 
         info!("🐞 LLM Response received from Claude");
 
-        let content = chat_response
-            .content
-            .get(0)
-            .ok_or("No content in LLM response")?
-            .text
-            .trim();
-        Ok(content.to_string())
+        chat_response.complete_text()
     } else {
         let chat_response = response
             .json::<ChatResponse>()
@@ -342,5 +401,59 @@ fn provider_name(provider: &LLMProvider) -> &str {
         LLMProvider::BuiltInAI => "Built-in AI",
         LLMProvider::OpenRouter => "OpenRouter",
         LLMProvider::CustomOpenAI => "Custom OpenAI",
+    }
+}
+
+#[cfg(test)]
+mod claude_output_tests {
+    use super::*;
+
+    #[test]
+    fn validates_budget_without_confusing_model_generations() {
+        assert_eq!(claude_max_tokens("claude-3-opus", None).unwrap(), 4096);
+        assert_eq!(claude_max_tokens("claude-3-5-sonnet-latest", None).unwrap(), 8192);
+        assert_eq!(claude_max_tokens("claude-sonnet-4-5", None).unwrap(), 8192);
+        assert_eq!(claude_max_tokens("claude-sonnet-4-5", Some(32000)).unwrap(), 32000);
+        assert_eq!(claude_max_tokens("claude-sonnet-4-50-unknown", None).unwrap(), 8192);
+        assert!(claude_max_tokens("claude-3-opus", Some(8192)).is_err());
+        for value in [0, -1, 64001, i64::MAX] {
+            assert!(claude_max_tokens("claude-sonnet-4-5", Some(value)).is_err());
+        }
+        assert!(claude_max_tokens("claude-unknown", Some(9000)).is_err());
+    }
+
+    #[test]
+    fn incomplete_claude_responses_never_succeed() {
+        for reason in ["max_tokens", "refusal", "pause_turn", "tool_use", "unknown"] {
+            let response: ClaudeChatResponse = serde_json::from_value(serde_json::json!({
+                "stop_reason": reason, "content": [{"type":"text", "text":"A plausible but incomplete summary"}]
+            })).unwrap();
+            assert!(response.complete_text().is_err(), "accepted {reason}");
+        }
+        let missing: ClaudeChatResponse = serde_json::from_str(r#"{"content":[{"type":"text","text":"partial"}]}"#).unwrap();
+        assert!(missing.complete_text().is_err());
+    }
+
+    #[test]
+    fn preserves_all_text_blocks_without_exposing_thinking() {
+        let response: ClaudeChatResponse = serde_json::from_str(r##"{
+            "stop_reason":"end_turn", "content":[
+                {"type":"thinking", "thinking":"private reasoning", "signature":"example"},
+                {"type":"text", "text":"# Summary\nContent"},
+                {"type":"text", "text":"# Decisions\nApproved"}
+            ]}"##).unwrap();
+        assert_eq!(response.complete_text().unwrap(), "# Summary\nContent\n# Decisions\nApproved");
+    }
+
+    #[tokio::test]
+    async fn summary_output_setting_round_trips_and_clears() {
+        use crate::database::repositories::setting::SettingsRepository;
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        SettingsRepository::save_model_config(&pool, "claude", "claude-sonnet-4-5", "large-v3", None, Some(32000)).await.unwrap();
+        assert_eq!(SettingsRepository::get_summary_max_tokens(&pool).await.unwrap(), Some(32000));
+        SettingsRepository::save_model_config(&pool, "claude", "claude-sonnet-4-5", "large-v3", None, None).await.unwrap();
+        assert_eq!(SettingsRepository::get_summary_max_tokens(&pool).await.unwrap(), None);
+        assert!(!include_bytes!("../../migrations/20260914010000_add_summary_max_tokens.sql").contains(&b'\r'));
     }
 }

@@ -1,5 +1,96 @@
 # Changelog
 
+## 0.2.15 - 2026-09-17
+
+### Maintenance
+
+- Keep Export, Enhance, and other meeting toolbar actions accessible at narrow
+  panel widths, using responsive icon labels, wrapping, and keyboard tooltips (#25).
+- Make Claude summary output length configurable with a larger application
+  default, model-aware validation, explicit errors for truncated responses,
+  effective-budget cache invalidation, and an LF-pinned migration (#29).
+- Preserve unavailable audio-device preferences while allowing explicit Default
+  selection, and use the active theme for native form controls (#23).
+- Keep the runtime resource directory present in clean source checkouts (#7).
+- Add read-only frontend PR checks: unit tests, production build, and TypeScript.
+- Retain the full Windows runtime crash fix from v0.2.14; PR #30 is superseded.
+- PR #12 remains pending macOS revisions and qualification. No macOS release.
+
+### Contributors
+
+- Thanks to @mhlas7, @cedstrom, and @0cv for the maintenance contributions.
+
+### Windows Downloads
+
+- Fresh CPU, Vulkan, and multi-architecture CUDA builds.
+- Manual installation uses the universal setup; in-app updates use the separate
+  Tauri-signed updater engine and matching signature. Authenticode is not configured.
+
+## 0.2.14 - 2026-09-17
+
+### Windows Crash Fix
+
+- Correct Windows event-loop target ownership in a narrowly patched, vendored
+  Tauri runtime 2.11.4. This addresses the background reference-count race
+  associated with the reported long-recording crash.
+- Keep strong ownership and destruction on the event-loop thread, use private
+  atomic weak references in cloned contexts, and route runtime monitor queries
+  to the owning thread. Preserve teardown ordering during panic unwinding.
+- This release contains the crash fix and release metadata only, with no PR
+  feature merges or macOS release changes.
+
+### Validation
+
+- Nine native lifecycle scenarios cover thread-affine destruction, shutdown,
+  panic unwinding, monitor dispatch, and WebView2 traffic. The stress case sends
+  50,000 IPC messages through two WebViews while workers clone/drop five million
+  webview handles. Three compile-fail doctests cover ownership boundaries.
+- The reporting user said the patched test build worked fine so far. The trial
+  duration is unconfirmed; these results do not establish a completed multi-hour
+  recording/minibar soak or guarantee that all causes of crashes are resolved.
+
+### Windows Downloads
+
+- Fresh CPU, Vulkan, and CUDA variants; CUDA targets multiple GPU generations.
+- Use `Meetily-ActuallyFree-0.2.14-x64-universal-setup.exe` for manual installation.
+  In-app updates use the universal updater engine and its matching Tauri signature.
+- `latest.json` and `SHA256SUMS.txt` provide updater metadata and file checksums.
+  Windows Authenticode remains unconfigured; Tauri updater signing is separate.
+
+## 0.2.13 - 2026-09-06
+
+### Bug Fixes
+
+- Display complete multilingual summary Markdown with original headings, lists,
+  tables, and code blocks; custom sections and decisions no longer disappear (#17).
+- Allow dragging the compact recording bar from any non-button surface with a
+  minibar-scoped native permission, preserving native recording lifecycle (#24).
+- Import OGG Opus and Vorbis through the existing bundled FFmpeg conversion path;
+  temporary conversion files no longer require a writable source folder (#21).
+- Use the application accent for checked settings switches in both themes (#18).
+
+### Reliability
+
+- Surface persistent summary failures and retry controls, validate selected Ollama
+  models, and prevent cancelled preflight requests from starting generation.
+- Reject empty summaries and failed transcript chunks rather than silently
+  saving incomplete summaries.
+- Keep recoverable transcription failures non-terminal and preserve IndexedDB
+  recovery writes when listener closures predate meeting initialization.
+- Cancel updater downloads natively, isolate stale cancellation by request ID,
+  and guard the non-cancellable installation phase.
+- Match Windows audio devices exactly and warn about unavailable loopback capture
+  or possible Zoom speaker-route mismatches. Zoom warnings are heuristic: endpoint
+  sound cannot be attributed to a particular application.
+
+### Windows Packaging
+
+- Fresh CPU, Vulkan, and CUDA variants are required for this release.
+- The universal setup is for manual installation; the signed universal updater
+  engine and its matching signature remain the target of `latest.json`.
+- Windows Authenticode is not configured. The Tauri updater signature is separate
+  and remains required. No macOS release is included.
+
 ## 0.2.12 - 2026-08-30
 
 ### Meeting Details
