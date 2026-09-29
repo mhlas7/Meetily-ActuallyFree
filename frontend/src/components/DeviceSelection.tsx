@@ -235,33 +235,33 @@ export function AudioDeviceCard({
         </div>
       )}
 
-      <div className=”border-t border-[var(--af-border)] px-3.5 py-3”>
-        <div className=”mb-2 text-[12px] font-medium text-[var(--af-text-3)]”>{levelLabel}</div>
+      <div className="border-t border-[var(--af-border)] px-3.5 py-3">
+        <div className="mb-2 text-[12px] font-medium text-[var(--af-text-3)]">{levelLabel}</div>
         {levelTick === undefined ? (
           <LiveAudioVisualizer
             active={meterActive}
-            source={kind === ‘mic’ ? ‘mic’ : ‘system’}
+            source={kind === 'mic' ? 'mic' : 'system'}
             bars={18}
             fill
-            className=”w-full”
+            className="w-full"
           />
         ) : (
           <LiveAudioVisualizer
             active
-            source={kind === ‘mic’ ? ‘mic’ : ‘system’}
+            source={kind === 'mic' ? 'mic' : 'system'}
             bars={18}
             fill
             feedRms={rmsLevel}
             feedPeak={peakLevel}
             feedTick={levelTick}
             displayGain={gain ?? 1}
-            className=”w-full”
+            className="w-full"
           />
         )}
         {unavailable && (
-          <p className=”mt-2 text-[11px] text-[var(--af-text-3)]”>{unavailable} is not connected.</p>
+          <p className="mt-2 text-[11px] text-[var(--af-text-3)]">{unavailable} is not connected.</p>
         )}
-        {note && <p className=”mt-2 text-[11px] text-[var(--af-text-3)]”>{note}</p>}
+        {note && <p className="mt-2 text-[11px] text-[var(--af-text-3)]">{note}</p>}
       </div>
     </div>
   );
