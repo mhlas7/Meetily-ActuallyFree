@@ -40,6 +40,7 @@ pub struct DiarizationModels {
 
 impl DiarizationModels {
     pub fn load(model_dir: &Path) -> Result<Self> {
+        crate::onnx_runtime::ensure_available()?;
         let seg_path = model_dir.join("segmentation-3.0-fp16.onnx");
         let emb_path = model_dir.join("wespeaker-resnet34-LM.onnx");
         let xform_path = model_dir.join("xvec_transform.npz");

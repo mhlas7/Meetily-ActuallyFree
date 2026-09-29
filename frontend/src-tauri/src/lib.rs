@@ -1,4 +1,4 @@
-﻿use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex as StdMutex;
 // Removed unused import
@@ -37,14 +37,21 @@ pub mod analytics;
 pub mod api;
 pub mod app_update;
 pub mod audio;
+pub mod claude_cli;
 pub mod config;
 pub mod console_utils;
 pub mod crash_report;
 pub mod database;
 pub mod diarization;
+mod optional_models;
 pub mod notifications;
 pub mod ollama;
 pub mod onboarding;
+pub mod onnx_runtime;
+#[cfg(all(test, windows))]
+#[allow(dead_code)]
+#[path = "../build/onnxruntime.rs"]
+mod onnx_runtime_build_tests;
 pub mod openai;
 pub mod anthropic;
 pub mod groq;
@@ -261,6 +268,27 @@ fn read_audio_file(file_path: String) -> Result<Vec<u8>, String> {
 }
 
 #[tauri::command]
+async fn get_meeting_playback_audio<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, state::AppState>,
+    meeting_id: String,
+) -> Result<Option<String>, String> {
+    let folder: Option<String> = sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
+        .bind(meeting_id)
+        .fetch_optional(state.db_manager.pool())
+        .await.map_err(|error| error.to_string())?.flatten();
+    let Some(folder) = folder else { return Ok(None); };
+    for name in ["audio.mp4", "audio.m4a", "audio.wav", "audio.mp3", "audio.webm"] {
+        let file = std::path::Path::new(&folder).join(name);
+        if file.is_file() {
+            app.asset_protocol_scope().allow_file(&file).map_err(|error| error.to_string())?;
+            return Ok(Some(file.to_string_lossy().into_owned()));
+        }
+    }
+    Ok(None)
+}
+
+#[tauri::command]
 async fn save_transcript(file_path: String, content: String) -> Result<(), String> {
     log_info!("Saving transcript to: {}", file_path);
 
@@ -462,6 +490,8 @@ pub fn run() {
             if let Err(error) = crash_report::start_session() {
                 log::error!("Failed to initialize crash reporting: {error}");
             }
+            #[cfg(windows)]
+            onnx_runtime::initialize(_app.handle());
             log::info!("Application setup complete");
 
             // Initialize system tray
@@ -611,6 +641,16 @@ pub fn run() {
             is_recording,
             get_transcription_status,
             read_audio_file,
+            get_meeting_playback_audio,
+            audio::waveform::get_waveform_peaks,
+            whisper_engine::labs::get_whisper_strict_silence,
+            whisper_engine::labs::set_whisper_strict_silence,
+            diarization::voice_profiles::get_voice_profiles_enabled,
+            diarization::voice_profiles::set_voice_profiles_enabled,
+            diarization::voice_profiles::enroll_voice_profile,
+            diarization::voice_profiles::enroll_person_voice,
+            diarization::voice_profiles::list_voice_profiles,
+            diarization::voice_profiles::delete_voice_profile,
             save_transcript,
             analytics::commands::init_analytics,
             analytics::commands::disable_analytics,
@@ -656,6 +696,8 @@ pub fn run() {
             whisper_engine::commands::whisper_delete_corrupted_model,
             // Parakeet engine commands
             parakeet_engine::commands::parakeet_init,
+            parakeet_engine::labs::get_parakeet_gpu_enabled,
+            parakeet_engine::labs::set_parakeet_gpu_enabled,
             parakeet_engine::commands::parakeet_get_available_models,
             parakeet_engine::commands::parakeet_load_model,
             parakeet_engine::commands::parakeet_get_current_model,
@@ -694,6 +736,7 @@ pub fn run() {
             crash_report::prepare_for_app_restart,
             crash_report::resume_crash_session,
             trigger_microphone_permission,
+            onnx_runtime::check_transcription_runtime,
             start_recording_with_devices,
             start_recording_with_devices_and_meeting,
             start_audio_level_monitoring,
@@ -723,6 +766,11 @@ pub fn run() {
             console_utils::show_console,
             console_utils::hide_console,
             console_utils::toggle_console,
+            claude_cli::commands::claude_cli_get_status,
+            claude_cli::commands::claude_cli_list_models,
+            claude_cli::commands::claude_cli_get_path,
+            claude_cli::commands::claude_cli_save_path,
+            claude_cli::commands::claude_cli_test_connection,
             ollama::get_ollama_models,
             ollama::pull_ollama_model,
             ollama::delete_ollama_model,
@@ -734,7 +782,29 @@ pub fn run() {
             api::api_search_transcripts,
             database::repositories::person::api_global_search,
             database::repositories::person::api_get_person_profile,
+            database::repositories::person::api_list_people,
             database::repositories::person::api_update_person_notes,
+            database::repositories::person::api_create_person,
+            database::repositories::person::api_update_person,
+            database::repositories::person::api_merge_people,
+            database::repositories::person::api_delete_person,
+            database::repositories::group::api_list_groups,
+            database::repositories::group::api_create_group,
+            database::repositories::group::api_update_group,
+            database::repositories::group::api_delete_group,
+            database::repositories::group::api_get_group,
+            database::repositories::group::api_set_meeting_group,
+            database::repositories::group::api_set_meetings_group,
+            database::repositories::group::api_get_meeting_group,
+            database::repositories::action_item::api_list_action_items,
+            database::repositories::action_item::api_create_action_item,
+            database::repositories::action_item::api_update_action_item,
+            database::repositories::action_item::api_delete_action_item,
+            database::repositories::action_item::api_sync_ai_action_items,
+            database::repositories::action_item::api_list_unsynced_action_meetings,
+            database::repositories::meeting_notes::api_get_meeting_notes,
+            database::repositories::meeting_notes::api_save_meeting_notes,
+            api::api_get_meeting_audio,
             meeting_detection::get_meeting_detection_settings,
             meeting_detection::set_meeting_detection_settings,
             meeting_detection::start_meeting_detection,
@@ -743,9 +813,16 @@ pub fn run() {
             diarization::diarization_model_directory,
             diarization::diarization_download_size,
             diarization::download_diarization_models,
+            optional_models::uninstall_optional_model,
             diarization::diarize_recording,
             diarization::diarize_meeting,
             diarization::rename_meeting_speaker,
+            diarization::reassign_transcript_speaker,
+            diarization::get_diarization_engine,
+            diarization::set_diarization_engine,
+            diarization::diarization_get_status,
+            diarization::set_diarization_config,
+            diarization::open_diarization_model_directory,
             minibar::enter_compact_mode,
             minibar::exit_compact_mode,
             minibar::is_compact_mode,
@@ -799,6 +876,7 @@ pub fn run() {
             summary::template_commands::api_is_custom_template,
             live_assistant::ask_live_assistant,
             live_assistant::ask_person,
+            live_assistant::api_ask_meeting,
             live_assistant::ollama_embed,
             // Built-in AI commands
             summary::summary_engine::commands::builtin_ai_list_models,
@@ -816,6 +894,8 @@ pub fn run() {
             audio::recording_preferences::open_recordings_folder,
             audio::recording_preferences::discard_recording_folder,
             audio::recording_preferences::select_recording_folder,
+            audio::recording_preferences::get_recordable_apps,
+            audio::recording_preferences::select_custom_app_executable,
             audio::recording_preferences::get_available_audio_backends,
             audio::recording_preferences::get_current_audio_backend,
             audio::recording_preferences::set_audio_backend,

@@ -34,9 +34,19 @@ use anyhow::Result;
 #[cfg(any(target_os = "macos", test))]
 use anyhow::{anyhow, Context};
 
-/// Hot source gains for the live capture path (f32 bits). Updated whenever prefs save.
 static MIC_GAIN_BITS: Lazy<AtomicU32> = Lazy::new(|| AtomicU32::new(1.0f32.to_bits()));
 static SYSTEM_GAIN_BITS: Lazy<AtomicU32> = Lazy::new(|| AtomicU32::new(1.0f32.to_bits()));
+static REAL_TIME_TRANSCRIPTION: Lazy<std::sync::atomic::AtomicBool> =
+    Lazy::new(|| std::sync::atomic::AtomicBool::new(false));
+
+/// Whether fast real-time transcription is enabled (shorter VAD pause time and max utterance capping).
+pub fn is_real_time_transcription() -> bool {
+    REAL_TIME_TRANSCRIPTION.load(Ordering::Relaxed)
+}
+
+pub fn set_real_time_transcription(enabled: bool) {
+    REAL_TIME_TRANSCRIPTION.store(enabled, Ordering::Relaxed);
+}
 
 /// Current mic gain multiplier (0.5–3.0). Applied after mic loudness normalize.
 pub fn mic_gain() -> f32 {
@@ -61,6 +71,15 @@ use log::error;
 #[cfg(target_os = "macos")]
 use crate::audio::capture::AudioCaptureBackend;
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct PerAppTarget {
+    pub id: String,
+    pub name: String,
+    pub executable: String,
+    #[serde(default)]
+    pub icon: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RecordingPreferences {
     pub save_folder: PathBuf,
@@ -76,9 +95,21 @@ pub struct RecordingPreferences {
     /// Gain applied to system audio before meters, VAD, retained tracks, and mixing.
     #[serde(default = "default_system_gain")]
     pub system_gain: f32,
+    /// Faster real-time streaming mode: cuts audio segments frequently (~3.5s) with
+    /// fast pause detection (350ms) to reduce latency, prevent memory bloat, and separate rapid speakers.
+    #[serde(default)]
+    pub real_time_transcription: bool,
     #[cfg(target_os = "macos")]
     #[serde(default)]
     pub system_audio_backend: Option<String>,
+    #[serde(default)]
+    pub per_app_recording_enabled: bool,
+    #[serde(default)]
+    pub per_app_target_app: Option<String>,
+    #[serde(default)]
+    pub per_app_target_name: Option<String>,
+    #[serde(default)]
+    pub per_app_targets: Vec<PerAppTarget>,
 }
 
 fn default_mic_gain() -> f32 {
@@ -99,8 +130,13 @@ impl Default for RecordingPreferences {
             preferred_system_device: None,
             mic_gain: 1.0,
             system_gain: 1.0,
+            real_time_transcription: false,
             #[cfg(target_os = "macos")]
             system_audio_backend: Some("coreaudio".to_string()),
+            per_app_recording_enabled: false,
+            per_app_target_app: None,
+            per_app_target_name: None,
+            per_app_targets: Vec::new(),
         }
     }
 }
@@ -316,12 +352,27 @@ pub async fn load_recording_preferences<R: Runtime>(
         prefs
     };
 
+    let mut prefs = prefs;
+    // Auto-migrate single legacy target to targets list if needed
+    if prefs.per_app_targets.is_empty() {
+        if let Some(exe) = &prefs.per_app_target_app {
+            let name = prefs.per_app_target_name.clone().unwrap_or_else(|| exe.clone());
+            prefs.per_app_targets.push(PerAppTarget {
+                id: exe.clone(),
+                name,
+                executable: exe.clone(),
+                icon: None,
+            });
+        }
+    }
+
     set_mic_gain_runtime(prefs.mic_gain);
     set_system_gain_runtime(prefs.system_gain);
-    info!("Loaded recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}, mic_gain={:.2}, system_gain={:.2}",
+    set_real_time_transcription(prefs.real_time_transcription);
+    info!("Loaded recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}, mic_gain={:.2}, system_gain={:.2}, real_time={}, per_app_enabled={}, per_app_targets_count={}, per_app_target={:?}",
           prefs.save_folder, prefs.auto_save, prefs.file_format,
            prefs.preferred_mic_device, prefs.preferred_system_device, prefs.mic_gain,
-           prefs.system_gain);
+           prefs.system_gain, prefs.real_time_transcription, prefs.per_app_recording_enabled, prefs.per_app_targets.len(), prefs.per_app_target_app);
     Ok(prefs)
 }
 
@@ -333,14 +384,29 @@ pub async fn save_recording_preferences<R: Runtime>(
     let mut preferences = preferences.clone();
     preferences.mic_gain = preferences.mic_gain.clamp(0.5, 3.0);
     preferences.system_gain = preferences.system_gain.clamp(0.5, 3.0);
+
+    // Keep legacy single target fields in sync with targets list for backward compatibility
+    if !preferences.per_app_targets.is_empty() {
+        preferences.per_app_target_app = Some(preferences.per_app_targets[0].executable.clone());
+        preferences.per_app_target_name = Some(preferences.per_app_targets[0].name.clone());
+    } else if let Some(exe) = &preferences.per_app_target_app {
+        let name = preferences.per_app_target_name.clone().unwrap_or_else(|| exe.clone());
+        preferences.per_app_targets.push(PerAppTarget {
+            id: exe.clone(),
+            name,
+            executable: exe.clone(),
+            icon: None,
+        });
+    }
+
     // Validate first so a bad custom path is never persisted and reused on the
     // next recording startup.
     ensure_recordings_directory(&preferences.save_folder)?;
 
-    info!("Saving recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}, mic_gain={:.2}, system_gain={:.2}",
+    info!("Saving recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}, mic_gain={:.2}, system_gain={:.2}, real_time={}, per_app_enabled={}, per_app_targets_count={}, per_app_target={:?}",
           preferences.save_folder, preferences.auto_save, preferences.file_format,
            preferences.preferred_mic_device, preferences.preferred_system_device,
-           preferences.mic_gain, preferences.system_gain);
+           preferences.mic_gain, preferences.system_gain, preferences.real_time_transcription, preferences.per_app_recording_enabled, preferences.per_app_targets.len(), preferences.per_app_target_app);
 
     // Get or create store
     let store = app
@@ -365,6 +431,7 @@ pub async fn save_recording_preferences<R: Runtime>(
 
     set_mic_gain_runtime(preferences.mic_gain);
     set_system_gain_runtime(preferences.system_gain);
+    set_real_time_transcription(preferences.real_time_transcription);
     info!("Successfully persisted recording preferences to disk");
 
     // Save backend preference to global config
@@ -419,6 +486,59 @@ pub async fn select_recording_folder<R: Runtime>(
     })
     .await
     .map_err(|error| format!("Recording folder dialog failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn get_recordable_apps() -> Result<Vec<crate::audio::capture::per_app::RecordableApp>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        crate::audio::capture::per_app::get_recordable_apps_list()
+            .map_err(|e| format!("Failed to list recordable apps: {}", e))
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn select_custom_app_executable<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<Option<crate::audio::capture::per_app::RecordableApp>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        let file_filter = ["exe"];
+        #[cfg(target_os = "macos")]
+        let file_filter = ["app"];
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let file_filter: [&str; 0] = [];
+
+        let file_path = app
+            .dialog()
+            .file()
+            .set_title("Select Application or Executable")
+            .add_filter("Application", &file_filter)
+            .blocking_pick_file();
+
+        if let Some(path) = file_path {
+            let path_str = path.to_string();
+            let p = std::path::Path::new(&path_str);
+            let exe_name = p.file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(&path_str)
+                .to_string();
+
+            Ok(Some(crate::audio::capture::per_app::RecordableApp {
+                id: exe_name.clone(),
+                name: exe_name.clone(),
+                executable: exe_name.clone(),
+                pid: crate::audio::capture::per_app::find_pid_for_app(&exe_name),
+                has_audio: false,
+                icon: None,
+            }))
+        } else {
+            Ok(None)
+        }
+    })
+    .await
+    .map_err(|e| format!("Failed to pick executable: {}", e))?
 }
 
 /// Delete a just-written meeting folder (used when a take is discarded as too short).
@@ -626,6 +746,29 @@ mod tests {
         .expect("legacy preferences should deserialize");
 
         assert_eq!(preferences.system_gain, 1.0);
+        assert!(!preferences.real_time_transcription);
+    }
+
+    #[test]
+    fn per_app_preferences_deserialize_multi_targets_and_legacy() {
+        let preferences: RecordingPreferences = serde_json::from_value(serde_json::json!({
+            "save_folder": "recordings",
+            "auto_save": true,
+            "file_format": "mp4",
+            "per_app_recording_enabled": true,
+            "per_app_target_app": "chrome.exe",
+            "per_app_target_name": "Google Chrome",
+            "per_app_targets": [
+                { "id": "chrome.exe", "name": "Google Chrome", "executable": "chrome.exe" },
+                { "id": "zoom.exe", "name": "Zoom Workplace", "executable": "zoom.exe" }
+            ]
+        }))
+        .expect("per-app preferences should deserialize");
+
+        assert!(preferences.per_app_recording_enabled);
+        assert_eq!(preferences.per_app_targets.len(), 2);
+        assert_eq!(preferences.per_app_targets[0].executable, "chrome.exe");
+        assert_eq!(preferences.per_app_targets[1].executable, "zoom.exe");
     }
 
     #[test]

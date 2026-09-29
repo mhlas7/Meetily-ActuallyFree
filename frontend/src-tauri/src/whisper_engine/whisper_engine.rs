@@ -591,7 +591,7 @@ impl WhisperEngine {
         // BALANCED FIX: Lowered from 0.75 to 0.55 to allow quiet speech detection
         // Previous value was too aggressive and rejected valid quiet speech
         // 0.55 is balanced - prevents hallucinations while preserving quiet speech
-        params.set_no_speech_thold(0.55);
+        params.set_no_speech_thold(if super::labs::strict_silence_enabled() { 0.45 } else { 0.55 });
         params.set_max_len(200);
         params.set_single_segment(false);
 
@@ -716,7 +716,7 @@ impl WhisperEngine {
         // BALANCED FIX: Lowered from 0.75 to 0.55 to allow quiet speech detection
         // Previous value was too aggressive and rejected valid quiet speech
         // 0.55 is balanced - prevents hallucinations while preserving quiet speech
-        params.set_no_speech_thold(0.55);
+        params.set_no_speech_thold(if super::labs::strict_silence_enabled() { 0.45 } else { 0.55 });
 
         // Reasonable length limits
         params.set_max_len(200);                 // Reasonable length

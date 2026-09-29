@@ -11,13 +11,13 @@
 //! watch, and an "ignored apps" list to suppress false positives.
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Runtime};
 
 /// Global run flag for the monitor loop. Setting this to `false` makes the
 /// currently-running loop exit on its next tick.
-static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
+static MONITOR_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Current settings, shared with the running loop so changes apply live.
 static SETTINGS: Mutex<Option<MeetingDetectionSettings>> = Mutex::new(None);
 
@@ -132,6 +132,14 @@ struct MeetingDetectedPayload {
     process: String,
     /// Whether the user asked for a native notification too.
     notify: bool,
+    /// Windows CapabilityAccessManager reports active mic/camera use.
+    active_media: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct MeetingEndedPayload {
+    app: String,
+    process: String,
 }
 
 /// True for our own process — never treat Meetily as a "meeting app".
@@ -147,7 +155,7 @@ fn is_self_process(name: &str) -> bool {
 /// alert if a *known* meeting app is among them. We never invent a name from a
 /// random exe (that produced the nonsense "Meetily meeting detected" toast when
 /// this app itself held the mic).
-fn scan_for_meeting_app(settings: &MeetingDetectionSettings) -> Option<(String, String)> {
+fn scan_for_meeting_app(settings: &MeetingDetectionSettings) -> Option<(String, String, bool)> {
     use sysinfo::System;
 
     let mut sys = System::new_all();
@@ -175,6 +183,9 @@ fn scan_for_meeting_app(settings: &MeetingDetectionSettings) -> Option<(String, 
     #[cfg(not(windows))]
     let media_in_use: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    #[cfg(windows)]
+    let browser_meeting_pids = windows_browser_meeting_pids();
+
     let matches_media = |name: &str| -> bool {
         if media_in_use.is_empty() {
             return true; // no CAM signal → don't require it
@@ -192,13 +203,17 @@ fn scan_for_meeting_app(settings: &MeetingDetectionSettings) -> Option<(String, 
             if is_skipped(&name) || !matches_media(&name) {
                 continue;
             }
+            #[cfg(windows)]
+            if is_browser(&name) && browser_meeting_pids.contains(&process.pid().as_u32()) {
+                return Some(("Browser meeting".into(), name, true));
+            }
             for keyword in &settings.meeting_apps {
                 let kw = keyword.trim().to_lowercase();
                 if kw.is_empty() {
                     continue;
                 }
                 if process_matches_keyword(&name, &kw) {
-                    return Some((friendly_name(&kw), name));
+                    return Some((friendly_name(&kw), name, true));
                 }
             }
         }
@@ -220,7 +235,7 @@ fn scan_for_meeting_app(settings: &MeetingDetectionSettings) -> Option<(String, 
                 continue;
             }
             if process_matches_keyword(&name, &kw) {
-                return Some((friendly_name(&kw), name));
+                return Some((friendly_name(&kw), name, false));
             }
         }
     }
@@ -238,16 +253,14 @@ fn windows_media_in_use_exes() -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     for cap in ["microphone", "webcam"] {
-        let path = format!(
-            "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\{cap}\\NonPackaged"
-        );
-        let Ok(root) = hkcu.open_subkey(&path) else {
-            continue;
-        };
-        let Ok(keys) = root.enum_keys().collect::<Result<Vec<_>, _>>() else {
-            continue;
-        };
-        for key_name in keys {
+        for suffix in ["NonPackaged", ""] {
+            let path = format!(
+                "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\{cap}\\{suffix}"
+            );
+            let Ok(root) = hkcu.open_subkey(&path) else { continue };
+            let Ok(keys) = root.enum_keys().collect::<Result<Vec<_>, _>>() else { continue };
+            for key_name in keys {
+            if key_name.eq_ignore_ascii_case("NonPackaged") { continue; }
             let Ok(sub) = root.open_subkey(&key_name) else {
                 continue;
             };
@@ -271,10 +284,51 @@ fn windows_media_in_use_exes() -> std::collections::HashSet<String> {
                 .to_lowercase();
             if exe.ends_with(".exe") {
                 out.insert(exe);
+            } else if key_name.to_lowercase().contains("msteams") {
+                // Packaged Teams stores a package family name rather than an exe.
+                out.insert("ms-teams.exe".into());
+            }
             }
         }
     }
     out
+}
+
+#[cfg(windows)]
+fn is_browser(name: &str) -> bool {
+    matches!(name, "chrome.exe" | "msedge.exe" | "firefox.exe")
+}
+
+#[cfg(windows)]
+fn windows_browser_meeting_pids() -> std::collections::HashSet<u32> {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible};
+    unsafe extern "system" fn visit(hwnd: HWND, state: isize) -> i32 {
+        let matches = &mut *(state as *mut std::collections::HashSet<u32>);
+        if IsWindowVisible(hwnd) == 0 { return 1; }
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 || len > 1024 { return 1; }
+        let mut title = vec![0u16; len as usize + 1];
+        let copied = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+        if copied <= 0 { return 1; }
+        let title = String::from_utf16_lossy(&title[..copied as usize]).to_lowercase();
+        if browser_title_is_meeting(&title) {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid != 0 { matches.insert(pid); }
+        }
+        1
+    }
+    let mut matches = std::collections::HashSet::new();
+    unsafe { EnumWindows(Some(visit), &mut matches as *mut _ as isize); }
+    matches
+}
+
+#[cfg(windows)]
+fn browser_title_is_meeting(title: &str) -> bool {
+    let title = title.to_lowercase();
+    ["google meet", "meet.google.com", "zoom meeting", "zoom.us/j/", "meeting | microsoft teams", "teams.microsoft.com", "slack huddle"]
+        .iter().any(|needle| title.contains(needle))
 }
 
 /// Does a process name match a meeting-app keyword?
@@ -321,12 +375,21 @@ mod tests {
         assert!(!process_matches_keyword("steam.exe", "teams"));
         assert!(!process_matches_keyword("steamwebhelper.exe", "teams"));
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn browser_title_requires_meeting_context() {
+        assert!(super::browser_title_is_meeting("Google Meet - Project Sync"));
+        assert!(super::browser_title_is_meeting("Meeting | Microsoft Teams - Edge"));
+        assert!(!super::browser_title_is_meeting("Meetily documentation - Chrome"));
+        assert!(!super::browser_title_is_meeting("Microsoft Teams home - Edge"));
+    }
 }
 
 /// Start (or restart) the background monitor with the given settings.
 fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
-    // Signal any existing loop to stop, then start a fresh one.
-    MONITOR_RUNNING.store(false, Ordering::SeqCst);
+    // A generation token prevents an old sleeping loop from reviving after a restart.
+    let generation = MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
 
     let settings = {
         let guard = SETTINGS.lock().unwrap();
@@ -337,19 +400,19 @@ fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
         return;
     }
 
-    MONITOR_RUNNING.store(true, Ordering::SeqCst);
     let app = app.clone();
 
     tauri::async_runtime::spawn(async move {
         log::info!("🔍 Meeting detection monitor started");
         // Whether we've already alerted for the currently-ongoing meeting app,
         // so we prompt once per meeting rather than every tick.
-        let mut alerted = false;
+        let mut alerted: Option<(String, String, bool)> = None;
+        let mut missing_since: Option<std::time::Instant> = None;
 
         // Give the loop a moment before the first heavy scan.
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-        while MONITOR_RUNNING.load(Ordering::SeqCst) {
+        while MONITOR_GENERATION.load(Ordering::SeqCst) == generation {
             let current = {
                 let guard = SETTINGS.lock().unwrap();
                 guard.clone().unwrap_or_default()
@@ -358,10 +421,23 @@ fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
                 break;
             }
 
-            match scan_for_meeting_app(&current) {
-                Some((friendly, process)) => {
-                    if !alerted {
-                        alerted = true;
+            let scan_settings = current.clone();
+            let scan = match tokio::task::spawn_blocking(move || scan_for_meeting_app(&scan_settings)).await {
+                Ok(scan) => scan,
+                Err(error) => { log::warn!("Meeting detection scan failed: {error}"); None }
+            };
+            if MONITOR_GENERATION.load(Ordering::SeqCst) != generation { break; }
+            // A process-only fallback must not keep a formerly active meeting
+            // alive after its microphone lease ends while the app stays open.
+            let scan = match (alerted.as_ref(), scan) {
+                (Some((_, process, true)), Some((_, candidate, false))) if process == &candidate => None,
+                (_, other) => other,
+            };
+            match scan {
+                Some((friendly, process, active_media)) => {
+                    missing_since = None;
+                    if alerted.as_ref() != Some(&(friendly.clone(), process.clone(), active_media)) {
+                        alerted = Some((friendly.clone(), process.clone(), active_media));
                         log::info!("🔔 Meeting app detected: {} ({})", friendly, process);
                         let _ = app.emit(
                             "meeting-detected",
@@ -369,13 +445,20 @@ fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
                                 app: friendly,
                                 process,
                                 notify: current.notify,
+                                active_media,
                             },
                         );
                     }
                 }
                 None => {
-                    // Meeting app closed — re-arm so the next meeting prompts again.
-                    alerted = false;
+                    if let Some((app_name, process, _)) = &alerted {
+                        let since = missing_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= std::time::Duration::from_secs(45) {
+                            let _ = app.emit("meeting-ended", MeetingEndedPayload { app: app_name.clone(), process: process.clone() });
+                            alerted = None;
+                            missing_since = None;
+                        }
+                    }
                 }
             }
 
@@ -383,7 +466,6 @@ fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
             tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
         }
 
-        MONITOR_RUNNING.store(false, Ordering::SeqCst);
         log::info!("🔍 Meeting detection monitor stopped");
     });
 }
@@ -430,7 +512,7 @@ pub async fn set_meeting_detection_settings<R: Runtime>(
     if settings.enabled {
         start_monitor(&app);
     } else {
-        MONITOR_RUNNING.store(false, Ordering::SeqCst);
+        MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
     }
     Ok(())
 }
@@ -445,6 +527,6 @@ pub async fn start_meeting_detection<R: Runtime>(app: AppHandle<R>) -> Result<()
 /// Manually stop the monitor.
 #[tauri::command]
 pub async fn stop_meeting_detection() -> Result<(), String> {
-    MONITOR_RUNNING.store(false, Ordering::SeqCst);
+    MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
     Ok(())
 }

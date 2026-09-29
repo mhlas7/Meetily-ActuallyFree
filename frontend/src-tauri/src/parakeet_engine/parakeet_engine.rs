@@ -9,6 +9,7 @@ use tokio::fs;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) const DOWNLOAD_CANCELLED_MESSAGE: &str = "Download cancelled by user";
 
@@ -125,7 +126,7 @@ pub struct ParakeetEngine {
     current_model: Arc<RwLock<Option<ParakeetModel>>>,
     current_model_name: Arc<RwLock<Option<String>>>,
     pub(crate) available_models: Arc<RwLock<HashMap<String, ModelInfo>>>,
-    cancel_downloads: Arc<RwLock<HashSet<String>>>,
+    cancel_downloads: Arc<RwLock<HashMap<String, Arc<CancellationToken>>>>,
     completed_cancellations: Arc<RwLock<HashSet<String>>>,
     // Active downloads tracking to prevent concurrent downloads
     pub(crate) active_downloads: Arc<RwLock<HashSet<String>>>, // Set of models currently being downloaded
@@ -208,7 +209,7 @@ impl ParakeetEngine {
             current_model: Arc::new(RwLock::new(None)),
             current_model_name: Arc::new(RwLock::new(None)),
             available_models: Arc::new(RwLock::new(HashMap::new())),
-            cancel_downloads: Arc::new(RwLock::new(HashSet::new())),
+            cancel_downloads: Arc::new(RwLock::new(HashMap::new())),
             completed_cancellations: Arc::new(RwLock::new(HashSet::new())),
             // Initialize active downloads tracking
             active_downloads: Arc::new(RwLock::new(HashSet::new())),
@@ -586,6 +587,7 @@ impl ParakeetEngine {
     ) -> Result<()> {
         log::info!("Starting download for Parakeet model: {}", model_name);
 
+        let cancellation = Arc::new(CancellationToken::new());
         {
             let mut active = self.active_downloads.write().await;
             if !active.insert(model_name.to_string()) {
@@ -598,12 +600,13 @@ impl ParakeetEngine {
                     model_name
                 ));
             }
+            // Publish/reset per-attempt cancellation under the ownership lock.
+            self.cancel_downloads.write().await.insert(model_name.to_string(), cancellation.clone());
+            self.completed_cancellations.write().await.remove(model_name);
         }
-        self.cancel_downloads.write().await.remove(model_name);
-        self.completed_cancellations.write().await.remove(model_name);
 
         let result = self
-            .download_model_detailed_reserved(model_name, progress_callback)
+            .download_model_detailed_reserved(model_name, progress_callback, &cancellation)
             .await;
         if let Err(error) = &result {
             let mut models = self.available_models.write().await;
@@ -621,8 +624,9 @@ impl ParakeetEngine {
                 .await
                 .insert(model_name.to_string());
         } else {
-            self.active_downloads.write().await.remove(model_name);
+            let mut active = self.active_downloads.write().await;
             self.cancel_downloads.write().await.remove(model_name);
+            active.remove(model_name);
         }
         result
     }
@@ -631,6 +635,7 @@ impl ParakeetEngine {
         &self,
         model_name: &str,
         progress_callback: Option<Box<dyn Fn(DownloadProgress) + Send>>,
+        cancellation: &CancellationToken,
     ) -> Result<()> {
         // Get model info
         let model_info = {
@@ -770,7 +775,7 @@ impl ParakeetEngine {
             let mut source_errors = Vec::new();
             let mut completed = false;
             for base_url in &base_urls {
-                if self.cancel_downloads.read().await.contains(model_name) {
+                if cancellation.is_cancelled() {
                     return Err(anyhow!(DOWNLOAD_CANCELLED_MESSAGE));
                 }
                 let resume_size = fs::metadata(&file_path)
@@ -783,58 +788,17 @@ impl ParakeetEngine {
                 }
 
                 let file_url = format!("{}/{}", base_url, filename);
-                let mut request = client.get(&file_url);
-                if resume_size > 0 {
-                    request = request.header("Range", format!("bytes={}-", resume_size));
-                }
-                let response = match timeout(Duration::from_secs(30), request.send()).await {
-                    Ok(Ok(candidate)) if candidate.status().is_success() => candidate,
-                    Ok(Ok(candidate)) => {
-                        source_errors.push(format!("{} returned {}", base_url, candidate.status()));
-                        continue;
-                    }
-                    Ok(Err(error)) => {
+                let (response, resuming) = match super::download_response::artifact_response(
+                    &client, &file_url, resume_size, expected_size, cancellation,
+                ).await {
+                    Ok(result) => result,
+                    Err(_) if cancellation.is_cancelled() => return Err(anyhow!(DOWNLOAD_CANCELLED_MESSAGE)),
+                    Err(error) => {
                         source_errors.push(format!("{}: {}", base_url, error));
                         continue;
                     }
-                    Err(_) => {
-                        source_errors.push(format!("{} timed out waiting for response headers", base_url));
-                        continue;
-                    }
                 };
-
-                let (file_total_size, resuming) =
-                    if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-                        let content_range = response
-                            .headers()
-                            .get(reqwest::header::CONTENT_RANGE)
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or_default();
-                        let expected_prefix = format!("bytes {}-", resume_size);
-                        let expected_suffix = format!("/{}", expected_size);
-                        let remaining = response.content_length().unwrap_or(0);
-                        if !content_range.starts_with(&expected_prefix)
-                            || !content_range.ends_with(&expected_suffix)
-                            || resume_size + remaining != expected_size
-                        {
-                            source_errors.push(format!(
-                                "{} returned unexpected resume range {}",
-                                base_url, content_range
-                            ));
-                            continue;
-                        }
-                        (resume_size + remaining, resume_size > 0)
-                    } else {
-                        let reported_size = response.content_length().unwrap_or(0);
-                        if reported_size != expected_size {
-                            source_errors.push(format!(
-                                "{} reports {} bytes, expected {}",
-                                base_url, reported_size, expected_size
-                            ));
-                            continue;
-                        }
-                        (reported_size, false)
-                    };
+                let file_total_size = expected_size;
 
                 log::info!("Downloading {} from {}", filename, base_url);
                 let file = if resuming {
@@ -858,12 +822,20 @@ impl ParakeetEngine {
                 let mut transfer_error = None;
 
                 loop {
-                    if self.cancel_downloads.read().await.contains(model_name) {
+                    if cancellation.is_cancelled() {
                         let _ = writer.flush().await;
                         return Err(anyhow!(DOWNLOAD_CANCELLED_MESSAGE));
                     }
 
-                    let chunk = match timeout(Duration::from_secs(30), stream.next()).await {
+                    let next = tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => {
+                            writer.flush().await?;
+                            return Err(anyhow!(DOWNLOAD_CANCELLED_MESSAGE));
+                        }
+                        result = timeout(Duration::from_secs(30), stream.next()) => result,
+                    };
+                    let chunk = match next {
                         Err(_) => {
                             transfer_error = Some("no data received for 30 seconds".to_string());
                             break;
@@ -876,6 +848,10 @@ impl ParakeetEngine {
                         Ok(Some(Ok(chunk))) => chunk,
                     };
 
+                    if chunk.len() as u64 > expected_size.saturating_sub(file_downloaded) {
+                        transfer_error = Some("Artifact exceeded its catalog size".to_string());
+                        break;
+                    }
                     writer
                         .write_all(&chunk)
                         .await
@@ -946,7 +922,7 @@ impl ParakeetEngine {
                 ));
             }
 
-            if self.cancel_downloads.read().await.contains(model_name) {
+            if cancellation.is_cancelled() {
                 return Err(anyhow!(DOWNLOAD_CANCELLED_MESSAGE));
             }
             if !completed {
@@ -965,7 +941,7 @@ impl ParakeetEngine {
             );
         }
 
-        if self.cancel_downloads.read().await.contains(model_name) {
+        if cancellation.is_cancelled() {
             return Err(anyhow!(DOWNLOAD_CANCELLED_MESSAGE));
         }
         self.validate_model_directory(model_dir)
@@ -975,7 +951,7 @@ impl ParakeetEngine {
         // Report 100% only after every file passes exact validation.
         let total_elapsed = download_start_time.elapsed().as_secs_f64();
         let final_speed = if total_elapsed > 0.0 {
-            ((total_downloaded - already_downloaded) as f64 / (1024.0 * 1024.0)) / total_elapsed
+            (total_downloaded.saturating_sub(already_downloaded) as f64 / (1024.0 * 1024.0)) / total_elapsed
         } else {
             0.0
         };
@@ -998,37 +974,80 @@ impl ParakeetEngine {
     }
 
     /// Cancel an ongoing model download
-    pub async fn cancel_download(&self, model_name: &str) -> Result<()> {
+    pub async fn cancel_download(&self, model_name: &str) -> Result<Arc<CancellationToken>> {
         log::info!("Cancelling download for Parakeet model: {}", model_name);
 
-        if !self.active_downloads.read().await.contains(model_name) {
+        let active = self.active_downloads.read().await;
+        if !active.contains(model_name) {
             return Err(anyhow!("No download in progress for model: {}", model_name));
         }
-        self.cancel_downloads
-            .write()
-            .await
-            .insert(model_name.to_string());
+        let token = self.cancel_downloads.read().await.get(model_name).cloned()
+            .ok_or_else(|| anyhow!("Download cancellation is not registered"))?;
+        token.cancel();
 
         // The worker flushes and retains partial files so a later attempt can
         // resume instead of redownloading hundreds of megabytes.
 
-        Ok(())
+        Ok(token)
     }
 
     pub(crate) async fn cancellation_completed(&self, model_name: &str) -> bool {
         self.completed_cancellations.read().await.contains(model_name)
     }
 
-    pub(crate) async fn release_cancelled_download(&self, model_name: &str) {
+    pub(crate) async fn download_is_current(&self, model_name: &str, token: &Arc<CancellationToken>) -> bool {
+        self.cancel_downloads.read().await.get(model_name).is_some_and(|current| Arc::ptr_eq(current, token))
+    }
+
+    pub(crate) async fn release_cancelled_download(
+        &self, model_name: &str, token: &Arc<CancellationToken>, emit_terminal: impl FnOnce(),
+    ) -> bool {
+        let mut active = self.active_downloads.write().await;
+        if !self.download_is_current(model_name, token).await ||
+            !self.completed_cancellations.read().await.contains(model_name) { return false; }
+        // A duplicate/stale Cancel cannot clear the next attempt or emit its
+        // terminal event after Retry has begun.
+        emit_terminal();
         self.completed_cancellations.write().await.remove(model_name);
         self.cancel_downloads.write().await.remove(model_name);
-        self.active_downloads.write().await.remove(model_name);
+        active.remove(model_name);
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn early_download_failure_releases_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = ParakeetEngine::new_with_models_dir(Some(dir.path().to_path_buf())).unwrap();
+        assert!(engine.download_model_detailed("not-a-model", None).await.is_err());
+        assert!(!engine.active_downloads.read().await.contains("not-a-model"));
+        assert!(!engine.cancel_downloads.read().await.contains_key("not-a-model"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_per_model_and_stale_release_cannot_clear_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = ParakeetEngine::new_with_models_dir(Some(dir.path().to_path_buf())).unwrap();
+        let a = Arc::new(CancellationToken::new());
+        let b = Arc::new(CancellationToken::new());
+        engine.active_downloads.write().await.extend(["a".into(), "b".into()]);
+        engine.cancel_downloads.write().await.extend([("a".into(), a.clone()), ("b".into(), b.clone())]);
+        let cancelled = engine.cancel_download("a").await.unwrap();
+        assert!(a.is_cancelled());
+        assert!(!b.is_cancelled());
+        engine.completed_cancellations.write().await.insert("a".into());
+        assert!(engine.release_cancelled_download("a", &cancelled, || {}).await);
+        let retry = Arc::new(CancellationToken::new());
+        engine.active_downloads.write().await.insert("a".into());
+        engine.cancel_downloads.write().await.insert("a".into(), retry.clone());
+        assert!(!engine.release_cancelled_download("a", &cancelled, || panic!("stale event")).await);
+        assert!(engine.download_is_current("a", &retry).await);
+        assert!(!retry.is_cancelled());
+    }
 
     #[test]
     fn v3_download_prefers_hugging_face_with_github_fallback() {

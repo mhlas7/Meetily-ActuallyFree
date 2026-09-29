@@ -1,4 +1,4 @@
-﻿//! Speaker diarization ("who spoke when") for recorded meetings.
+//! Speaker diarization ("who spoke when") for recorded meetings.
 //!
 //! Pipeline (all on-device, ONNX Runtime via `ort`):
 //!   1. Load the meeting WAV, downmix to mono and resample to 16 kHz.
@@ -18,8 +18,11 @@ pub mod clustering;
 pub mod download;
 pub mod dsp;
 pub mod models;
+pub mod nemotron;
 pub mod online;
+pub mod live_nemotron;
 pub mod voiceprint;
+pub mod voice_profiles;
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -81,12 +84,74 @@ pub struct DiarizationResult {
     pub user_speaker: Option<usize>,
 }
 
-/// Required model files.
+/// Required model files for Pyannote pipeline.
 const REQUIRED_FILES: [&str; 3] = [
     "segmentation-3.0-fp16.onnx",
     "wespeaker-resnet34-LM.onnx",
     "xvec_transform.npz",
 ];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiarizationConfig {
+    pub engine: String, // "pyannote" or "nemotron"
+    pub nemotron_max_speakers: usize,
+    pub nemotron_threshold: f32,
+    pub pyannote_threshold: f32,
+}
+
+impl Default for DiarizationConfig {
+    fn default() -> Self {
+        Self {
+            engine: "pyannote".to_string(),
+            nemotron_max_speakers: nemotron::DEFAULT_MAX_SPEAKERS,
+            nemotron_threshold: nemotron::DEFAULT_NEMOTRON_THRESHOLD,
+            pyannote_threshold: DEFAULT_THRESHOLD,
+        }
+    }
+}
+
+static CONFIG: std::sync::OnceLock<std::sync::RwLock<DiarizationConfig>> = std::sync::OnceLock::new();
+
+fn get_config_lock() -> &'static std::sync::RwLock<DiarizationConfig> {
+    CONFIG.get_or_init(|| {
+        let path = crate::paths::install_data_root().join("diarization_config.json");
+        let cfg = if path.exists() {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|content| serde_json::from_str::<DiarizationConfig>(&content).ok())
+                .unwrap_or_default()
+        } else {
+            DiarizationConfig::default()
+        };
+        std::sync::RwLock::new(cfg)
+    })
+}
+
+pub fn get_active_engine() -> String {
+    get_config_lock()
+        .read()
+        .map(|c| c.engine.clone())
+        .unwrap_or_else(|_| "pyannote".to_string())
+}
+
+pub fn get_diarization_config() -> DiarizationConfig {
+    get_config_lock()
+        .read()
+        .map(|c| c.clone())
+        .unwrap_or_default()
+}
+
+pub fn save_diarization_config(cfg: &DiarizationConfig) -> Result<()> {
+    anyhow::ensure!(matches!(cfg.engine.as_str(), "pyannote" | "nemotron"), "Unknown diarization engine");
+    anyhow::ensure!(cfg.nemotron_threshold.is_finite() && (0.1..=0.9).contains(&cfg.nemotron_threshold), "Invalid Nemotron threshold");
+    anyhow::ensure!(cfg.pyannote_threshold.is_finite() && (0.1..=0.9).contains(&cfg.pyannote_threshold), "Invalid Pyannote threshold");
+    let mut lock = get_config_lock().write().map_err(|_| anyhow!("Diarization settings lock poisoned"))?;
+    let path = crate::paths::install_data_root().join("diarization_config.json");
+    let json = serde_json::to_string_pretty(cfg)?;
+    std::fs::write(path, json)?;
+    *lock = cfg.clone();
+    Ok(())
+}
 
 /// Directory of the models shipped inside the app bundle, resolved once at
 /// startup from Tauri's resource directory.
@@ -100,6 +165,11 @@ pub async fn operation_guard() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
+pub fn try_operation_guard() -> Result<tokio::sync::MutexGuard<'static, ()>, String> {
+    OPERATION_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .try_lock().map_err(|_| "Wait for speaker identification to finish before uninstalling".into())
+}
+
 /// Record where the bundled diarization models live (called during setup).
 pub fn set_bundled_dir(dir: PathBuf) {
     let _ = BUNDLED_DIR.set(dir);
@@ -110,7 +180,7 @@ fn dir_has_models(dir: &Path) -> bool {
     REQUIRED_FILES.iter().all(|f| dir.join(f).exists())
 }
 
-/// Where the app's *writable* diarization model directory is â€” the target for
+/// Where the app's *writable* diarization model directory is — the target for
 /// manual installs and downloads.
 pub fn diarization_user_model_dir() -> PathBuf {
     crate::paths::models_dir().join("diarization")
@@ -134,9 +204,30 @@ pub fn diarization_model_dir() -> PathBuf {
     user_dir
 }
 
-/// Whether all required model files are present (bundled or user-supplied).
-pub fn models_available() -> bool {
+/// Whether Pyannote model files are present (bundled or user-supplied).
+pub fn pyannote_models_available() -> bool {
     dir_has_models(&diarization_model_dir())
+}
+
+/// Whether Nemotron-3 model files are present.
+pub fn nemotron_models_available() -> bool {
+    let user_dir = diarization_user_model_dir();
+    let model_file = user_dir.join(nemotron::NEMOTRON_MODEL_FILENAME);
+    model_file.metadata().is_ok_and(|m| m.is_file() && m.len() == nemotron::NEMOTRON_EXPECTED_BYTES)
+}
+
+/// Whether models for the specified engine are present.
+pub fn models_available_for_engine(engine: &str) -> bool {
+    if engine.eq_ignore_ascii_case("nemotron") {
+        nemotron_models_available()
+    } else {
+        pyannote_models_available()
+    }
+}
+
+/// Whether models for the currently active engine are present.
+pub fn models_available() -> bool {
+    models_available_for_engine(&get_active_engine())
 }
 
 /// One local speaker's activity inside one window.
@@ -151,22 +242,49 @@ struct LocalTurn {
     speech_secs: f32,
 }
 
-/// Run the full diarization pipeline on a WAV file, using whichever model
-/// directory the app resolved (user override, else bundled).
+/// Run the full diarization pipeline on a WAV file using the active engine.
 pub fn diarize_file(
     wav_path: &std::path::Path,
     num_speakers: Option<usize>,
     threshold: Option<f32>,
 ) -> Result<DiarizationResult> {
-    let model_dir = diarization_model_dir();
-    if !models_available() {
-        return Err(anyhow!(
-            "Diarization models not found in {}. Expected segmentation-3.0-fp16.onnx, \
-             wespeaker-resnet34-LM.onnx and xvec_transform.npz.",
-            model_dir.display()
-        ));
+    diarize_file_with_engine(wav_path, &get_active_engine(), num_speakers, threshold)
+}
+
+/// Run diarization using a specific engine ("pyannote" or "nemotron").
+pub fn diarize_file_with_engine(
+    wav_path: &std::path::Path,
+    engine: &str,
+    num_speakers: Option<usize>,
+    threshold: Option<f32>,
+) -> Result<DiarizationResult> {
+    anyhow::ensure!(matches!(engine, "pyannote" | "nemotron"), "Unknown diarization engine");
+    if engine == "nemotron" {
+        if !nemotron_models_available() {
+            return Err(anyhow!(
+                "Nemotron-3 diarization model not found in {}. Expected nemotron3_diar_v3.onnx.",
+                diarization_user_model_dir().display()
+            ));
+        }
+        let config = get_diarization_config();
+        let max_spks = 8;
+        let thresh = threshold.unwrap_or(config.nemotron_threshold);
+        let model_path = diarization_user_model_dir().join(nemotron::NEMOTRON_MODEL_FILENAME);
+        let mut model = nemotron::NemotronDiarizationModel::new(&model_path, max_spks, thresh)?;
+
+        let (samples, sr) = dsp::read_wav(wav_path)?;
+        model.diarize(&samples, sr)
+    } else {
+        let model_dir = diarization_model_dir();
+        if !pyannote_models_available() {
+            return Err(anyhow!(
+                "Pyannote diarization models not found in {}. Expected segmentation-3.0-fp16.onnx, \
+                 wespeaker-resnet34-LM.onnx and xvec_transform.npz.",
+                model_dir.display()
+            ));
+        }
+        diarize_file_with_models(wav_path, &model_dir, num_speakers, threshold)
     }
-    diarize_file_with_models(wav_path, &model_dir, num_speakers, threshold)
 }
 
 /// Extract just the per-turn speaker embeddings for a recording.
@@ -452,35 +570,152 @@ pub async fn diarization_model_directory() -> Result<String, String> {
     Ok(diarization_user_model_dir().to_string_lossy().to_string())
 }
 
+/// Status report of the diarization subsystem.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiarizationEngineStatus {
+    pub active_engine: String,
+    pub pyannote_available: bool,
+    pub nemotron_available: bool,
+    pub current_available: bool,
+    pub model_dir: String,
+    pub nemotron_max_speakers: usize,
+    pub nemotron_threshold: f32,
+    pub pyannote_threshold: f32,
+    pub nemotron_download_size: u64,
+    pub pyannote_download_size: u64,
+}
+
+#[tauri::command]
+pub async fn get_diarization_engine() -> Result<String, String> {
+    Ok(get_active_engine())
+}
+
+#[tauri::command]
+pub async fn set_diarization_engine(engine: String) -> Result<(), String> {
+    let mut cfg = get_diarization_config();
+    cfg.engine = engine.to_lowercase();
+    save_diarization_config(&cfg).map_err(|e| e.to_string())?;
+    log::info!("🔄 Switched diarization engine to {}", cfg.engine);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn diarization_get_status() -> Result<DiarizationEngineStatus, String> {
+    let cfg = get_diarization_config();
+    let py_avail = pyannote_models_available();
+    let nemo_avail = nemotron_models_available();
+    let current_avail = if cfg.engine.eq_ignore_ascii_case("nemotron") {
+        nemo_avail
+    } else {
+        py_avail
+    };
+
+    Ok(DiarizationEngineStatus {
+        active_engine: cfg.engine,
+        pyannote_available: py_avail,
+        nemotron_available: nemo_avail,
+        current_available: current_avail,
+        model_dir: diarization_user_model_dir().to_string_lossy().to_string(),
+        nemotron_max_speakers: cfg.nemotron_max_speakers,
+        nemotron_threshold: cfg.nemotron_threshold,
+        pyannote_threshold: cfg.pyannote_threshold,
+        nemotron_download_size: download::nemotron_download_bytes(),
+        pyannote_download_size: download::total_download_bytes(),
+    })
+}
+
+#[tauri::command]
+pub async fn set_diarization_config(
+    engine: String,
+    nemotron_max_speakers: Option<usize>,
+    nemotron_threshold: Option<f32>,
+    pyannote_threshold: Option<f32>,
+) -> Result<(), String> {
+    let mut cfg = get_diarization_config();
+    cfg.engine = engine.to_lowercase();
+    if let Some(m) = nemotron_max_speakers {
+        if !(1..=8).contains(&m) { return Err("Invalid speaker capacity".into()); }
+    }
+    cfg.nemotron_max_speakers = 8;
+    if let Some(t) = nemotron_threshold {
+        cfg.nemotron_threshold = t;
+    }
+    if let Some(t) = pyannote_threshold {
+        cfg.pyannote_threshold = t;
+    }
+    save_diarization_config(&cfg).map_err(|e| e.to_string())?;
+    log::info!("💾 Saved diarization config: {:?}", cfg);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn open_diarization_model_directory() -> Result<(), String> {
+    let dir = diarization_user_model_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Total size of the diarization model download, in bytes.
 #[tauri::command]
 pub async fn diarization_download_size() -> Result<u64, String> {
-    Ok(download::total_download_bytes())
+    let engine = get_active_engine();
+    if engine.eq_ignore_ascii_case("nemotron") {
+        Ok(download::nemotron_download_bytes())
+    } else {
+        Ok(download::total_download_bytes())
+    }
 }
 
-/// Download the diarization models from this fork's GitHub release.
+/// Download the diarization models.
 /// Progress is emitted as `diarization-download-progress` events.
 #[tauri::command]
 pub async fn download_diarization_models<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
+    engine: Option<String>,
 ) -> Result<(), String> {
-    download::download_models(&app).await.map_err(|e| {
+    let target = engine.unwrap_or_else(get_active_engine);
+    let _optional_guard = if target == "nemotron" { Some(crate::optional_models::operation("nemotron")?) } else { None };
+    if !matches!(target.as_str(), "pyannote" | "nemotron") { return Err("Unknown diarization engine".into()); }
+    static DOWNLOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _download_guard = DOWNLOAD_LOCK.try_lock().map_err(|_| "A diarization download is already running".to_string())?;
+    download::download_models_for_engine(&app, &target).await.map_err(|e| {
         log::error!("Diarization model download failed: {}", e);
         e.to_string()
-    })
+    })?;
+    // Finish the opt-in download in the native task. A WebView reload during
+    // setup must not discard the preference save along with its JS callback.
+    if target == "nemotron" {
+        set_diarization_engine(target).await.map_err(|e| {
+            format!("Model downloaded, but could not enable it: {e}")
+        })?;
+        use tauri::Emitter;
+        let _ = app.emit("diarization-engine-changed", "nemotron");
+    }
+    Ok(())
 }
 
 /// Rename every transcript segment belonging to one speaker in a meeting.
-///
-/// Automatic speaker identification is a heuristic and will sometimes be wrong,
-/// and it can never recover who is who in meetings recorded before it existed.
-/// This lets the user state the truth directly — including marking a speaker as
-/// themselves by naming them "You", which the UI renders with their display
-/// name.
-///
-/// A blank `to` removes the assigned identity, deletes its person mapping, and
-/// restores the lowest available meeting-local `Speaker N` label. The returned
-/// label is authoritative for transcript refresh and summary regeneration.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeetingSpeakerRenameResult {
@@ -517,16 +752,43 @@ pub async fn rename_meeting_speaker(
     })
 }
 
+/// Move a single transcript line to another speaker. The rest of that label stays put.
+#[tauri::command]
+pub async fn reassign_transcript_speaker(
+    state: tauri::State<'_, crate::state::AppState>,
+    meeting_id: String,
+    transcript_id: String,
+    to: String,
+) -> Result<MeetingSpeakerRenameResult, String> {
+    let _operation_guard = operation_guard().await;
+    let outcome = crate::database::repositories::person::PeopleRepository::reassign_transcript_speaker(
+        state.db_manager.pool(),
+        &meeting_id,
+        &transcript_id,
+        &to,
+    )
+    .await
+    .map_err(|e| format!("Failed to move this line: {}", e))?;
+    Ok(MeetingSpeakerRenameResult {
+        speaker: outcome.speaker,
+        count: outcome.count,
+        removed_name: outcome.removed_name,
+    })
+}
+
 /// Run diarization on a recording and return speaker-labeled time segments.
 #[tauri::command]
 pub async fn diarize_recording(
     audio_path: String,
     num_speakers: Option<usize>,
     threshold: Option<f32>,
+    engine: Option<String>,
 ) -> Result<DiarizationResult, String> {
     let path = PathBuf::from(&audio_path);
+    let selected_engine = engine.unwrap_or_else(get_active_engine);
+    if !matches!(selected_engine.as_str(), "pyannote" | "nemotron") { return Err("Unknown diarization engine".into()); }
     // Model inference is CPU-heavy; keep it off the async runtime's core threads.
-    tokio::task::spawn_blocking(move || diarize_file(&path, num_speakers, threshold))
+    tokio::task::spawn_blocking(move || diarize_file_with_engine(&path, &selected_engine, num_speakers, threshold))
         .await
         .map_err(|e| format!("Diarization task failed: {}", e))?
         .map_err(|e| {
@@ -628,37 +890,41 @@ fn find_meeting_audio(folder_path: Option<String>, meeting_title: Option<&str>) 
     newest_audio_in(&crate::paths::install_data_root())
 }
 
-fn apply_source_track_hint(
-    existing: Option<&str>,
-    used_source_tracks: bool,
-    allow_remote_hint: bool,
-    labels: &mut Vec<String>,
-) {
-    if !used_source_tracks {
-        return;
+fn is_manual_speaker_label(label: &str) -> bool {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return false;
     }
-    match existing {
-        Some(speaker) if speaker.eq_ignore_ascii_case("you") => {
-            labels.retain(|label| !label.eq_ignore_ascii_case("you"));
-            labels.insert(0, "You".to_string());
+    let is_generated = trimmed.split(" + ").all(|part| {
+        let p = part.trim();
+        p.eq_ignore_ascii_case("guest")
+            || p.eq_ignore_ascii_case("you")
+            || p.eq_ignore_ascii_case("unknown")
+            || (p.to_ascii_lowercase().starts_with("speaker ")
+                && p[8..].trim().chars().all(|c| c.is_ascii_digit()))
+    });
+    !is_generated
+}
+
+fn extract_manual_speaker_names(label: &str) -> Vec<String> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    for part in trimmed.split(" + ") {
+        let p = part.trim();
+        if !p.is_empty()
+            && !p.eq_ignore_ascii_case("guest")
+            && !p.eq_ignore_ascii_case("you")
+            && !p.eq_ignore_ascii_case("unknown")
+            && !(p.to_ascii_lowercase().starts_with("speaker ")
+                && p[8..].trim().chars().all(|c| c.is_ascii_digit()))
+        {
+            names.push(p.to_string());
         }
-        Some(speaker) if allow_remote_hint && speaker.eq_ignore_ascii_case("guest") => {
-            let has_remote = labels.iter().any(|label| {
-                !label.eq_ignore_ascii_case("you") && !label.eq_ignore_ascii_case("guest")
-            });
-            if !has_remote && !labels.iter().any(|label| label.eq_ignore_ascii_case("guest")) {
-                labels.push("Guest".to_string());
-            }
-        }
-        _ => {}
     }
-    if let Some(position) = labels
-        .iter()
-        .position(|label| label.eq_ignore_ascii_case("you"))
-    {
-        let user = labels.remove(position);
-        labels.insert(0, user);
-    }
+    names
 }
 
 /// Decode any supported audio container to a temporary 16 kHz mono WAV using
@@ -715,8 +981,7 @@ fn ensure_wav(path: &Path) -> Result<(PathBuf, bool)> {
     Ok((out, true))
 }
 
-/// Diarize a meeting's recording and assign "Speaker N" labels to its
-/// transcript segments (by maximum time overlap), persisting them.
+/// Diarize a meeting's recording and assign "Speaker N" labels to its transcript segments.
 #[tauri::command]
 pub async fn diarize_meeting(
     state: tauri::State<'_, crate::state::AppState>,
@@ -724,9 +989,14 @@ pub async fn diarize_meeting(
     audio_path: Option<String>,
     num_speakers: Option<usize>,
     threshold: Option<f32>,
+    engine: Option<String>,
 ) -> Result<MeetingDiarizationResult, String> {
     let _operation_guard = operation_guard().await;
     let pool = state.db_manager.pool();
+    let selected_engine = engine.unwrap_or_else(get_active_engine);
+    if !matches!(selected_engine.as_str(), "pyannote" | "nemotron") { return Err("Unknown diarization engine".into()); }
+    // Counts saved by older UI versions must not silently switch the engine.
+    let num_speakers = if selected_engine == "nemotron" { None } else { num_speakers };
 
     // Resolve the recording.
     let meeting: Option<(Option<String>, String)> =
@@ -743,7 +1013,7 @@ pub async fn diarize_meeting(
 
     let source = match audio_path {
         Some(p) => PathBuf::from(p),
-        None => find_meeting_audio(folder_path, title.as_deref()).ok_or_else(|| {
+        None => find_meeting_audio(folder_path.clone(), title.as_deref()).ok_or_else(|| {
             format!(
                 "No recording found for this meeting. Looked in the meeting folder, \
                  {} and the app data folder.",
@@ -751,14 +1021,11 @@ pub async fn diarize_meeting(
             )
         })?,
     };
-    log::info!("🧑‍🤝‍🧑 Diarizing meeting {} using {}", meeting_id, source.display());
+    log::info!("🧑‍🤝‍🧑 Diarizing meeting {} with {} using {}", meeting_id, selected_engine, source.display());
 
-    // Run the CPU-heavy pipeline off the async core threads. New recordings
-    // have dedicated mic/system tracks: mic is deterministically "You" and
-    // only the system track needs remote-speaker clustering. Older meetings
-    // fall back to the mixed recording + enrolled voiceprint.
     let voiceprint_source = meeting_id.clone();
-    let (result, used_source_tracks) = tokio::task::spawn_blocking(move || -> Result<(DiarizationResult, bool)> {
+    let engine_for_blocking = selected_engine.clone();
+    let (result, used_source_tracks, profile_names) = tokio::task::spawn_blocking(move || -> Result<(DiarizationResult, bool, std::collections::HashMap<usize, String>)> {
         let parent = source.parent().map(Path::to_path_buf);
         let mic_source = parent.as_ref().map(|p| p.join("mic.mp4"));
         let system_source = parent.as_ref().map(|p| p.join("system.mp4"));
@@ -782,25 +1049,82 @@ pub async fn diarize_meeting(
                 };
 
                 let dual_result = (|| -> Result<DiarizationResult> {
-                    // Enroll each recording at most once so manual reruns cannot
-                    // overweight one meeting in the persistent profile.
+                    let remote_count = num_speakers.map(|k| k.saturating_sub(1).max(1));
+
+                    if engine_for_blocking.eq_ignore_ascii_case("nemotron") {
+                        let config = get_diarization_config();
+                        let max_spks = num_speakers.unwrap_or(config.nemotron_max_speakers);
+                        let thresh = threshold.unwrap_or(config.nemotron_threshold);
+                        let model_path = diarization_user_model_dir().join(nemotron::NEMOTRON_MODEL_FILENAME);
+                        let mut nemotron_model = nemotron::NemotronDiarizationModel::new(&model_path, max_spks, thresh)?;
+
+                        let (mic_samples, mic_sr) = dsp::read_wav(&mic_wav)?;
+                        let mic_result = nemotron_model.diarize(&mic_samples, mic_sr)?;
+
+                        nemotron_model.reset_streaming_state();
+                        let system_result = if num_speakers == Some(1) {
+                            DiarizationResult {
+                                segments: Vec::new(),
+                                num_speakers: 0,
+                                duration: mic_result.duration,
+                                user_speaker: None,
+                            }
+                        } else {
+                            let (sys_samples, sys_sr) = dsp::read_wav(&system_wav)?;
+                            nemotron_model.diarize(&sys_samples, sys_sr)?
+                        };
+
+                        let mut segments: Vec<DiarizationSegment> = mic_result
+                            .segments
+                            .into_iter()
+                            .map(|mut s| {
+                                s.speaker = 0;
+                                s
+                            })
+                            .collect();
+                        segments.extend(system_result.segments.into_iter().map(|mut s| {
+                            s.speaker += 1;
+                            s
+                        }));
+                        segments.sort_by(|a, b| {
+                            a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+
+                        let snapshot = segments.clone();
+                        for seg in &mut segments {
+                            if snapshot.iter().any(|other| {
+                                other.speaker != seg.speaker
+                                    && other.start < seg.end
+                                    && other.end > seg.start
+                            }) {
+                                seg.overlapped = true;
+                            }
+                        }
+
+                        let num_remote = system_result.num_speakers;
+                        let duration = mic_result.duration.max(system_result.duration);
+                        return Ok(DiarizationResult {
+                            segments,
+                            num_speakers: 1 + num_remote,
+                            duration,
+                            user_speaker: Some(0),
+                        });
+                    }
+
+                    // Pyannote dual track path
                     let model_dir = diarization_model_dir();
                     let mic_embeddings = embeddings_for_debug(&mic_wav, &model_dir).ok();
 
-                    let mic_result = diarize_file(&mic_wav, Some(1), threshold)?;
-                // UI count includes the user, so system audio gets k - 1.
-                let remote_count = num_speakers.map(|k| k.saturating_sub(1).max(1));
+                    let mic_result = diarize_file_with_models(&mic_wav, &model_dir, Some(1), threshold)?;
                     let system_result = if num_speakers == Some(1) {
-                    // The entered total includes the user. For a solo meeting,
-                    // ignore incidental system sounds instead of inventing a guest.
-                    DiarizationResult {
-                        segments: Vec::new(),
-                        num_speakers: 0,
-                        duration: mic_result.duration,
-                        user_speaker: None,
-                    }
+                        DiarizationResult {
+                            segments: Vec::new(),
+                            num_speakers: 0,
+                            duration: mic_result.duration,
+                            user_speaker: None,
+                        }
                     } else {
-                        diarize_file(&system_wav, remote_count, threshold)?
+                        diarize_file_with_models(&system_wav, &model_dir, remote_count, threshold)?
                     };
                     if let Some(embeddings) = mic_embeddings {
                         let labels = clustering::agglomerative(
@@ -826,34 +1150,34 @@ pub async fn diarize_meeting(
 
                     // Speaker 0 is always You; remote speakers begin at 1.
                     let mut segments: Vec<DiarizationSegment> = mic_result
-                    .segments
-                    .into_iter()
-                    .map(|mut s| {
-                        s.speaker = 0;
-                        s
-                    })
-                    .collect();
+                        .segments
+                        .into_iter()
+                        .map(|mut s| {
+                            s.speaker = 0;
+                            s
+                        })
+                        .collect();
                     segments.extend(system_result.segments.into_iter().map(|mut s| {
-                    s.speaker += 1;
-                    s
-                }));
+                        s.speaker += 1;
+                        s
+                    }));
                     segments.sort_by(|a, b| {
-                    a.start
-                        .partial_cmp(&b.start)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                        a.start
+                            .partial_cmp(&b.start)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
 
-                // Cross-track overlap means local + remote speech at once.
+                    // Cross-track overlap means local + remote speech at once.
                     let snapshot = segments.clone();
                     for seg in &mut segments {
-                    if snapshot.iter().any(|other| {
-                        other.speaker != seg.speaker
-                            && other.start < seg.end
-                            && other.end > seg.start
-                    }) {
-                        seg.overlapped = true;
+                        if snapshot.iter().any(|other| {
+                            other.speaker != seg.speaker
+                                && other.start < seg.end
+                                && other.end > seg.start
+                        }) {
+                            seg.overlapped = true;
+                        }
                     }
-                }
 
                     let num_remote = system_result.num_speakers;
                     let duration = mic_result.duration.max(system_result.duration);
@@ -865,22 +1189,33 @@ pub async fn diarize_meeting(
                     })
                 })();
 
+                let profile_names = match &dual_result {
+                    Ok(result) => match voice_profiles::match_offline_speakers(&system_wav, &result.segments.iter()
+                        .filter(|segment| segment.speaker != 0).cloned().collect::<Vec<_>>()) {
+                        Ok(names) => names,
+                        Err(error) => {
+                            log::warn!("Named voice matching unavailable for offline diarization: {error}");
+                            std::collections::HashMap::new()
+                        }
+                    },
+                    Err(_) => std::collections::HashMap::new(),
+                };
                 if mic_temp {
                     let _ = std::fs::remove_file(&mic_wav);
                 }
                 if system_temp {
                     let _ = std::fs::remove_file(&system_wav);
                 }
-                return dual_result.map(|result| (result, true));
+                return dual_result.map(|result| (result, true, profile_names));
             }
         }
 
         let (wav, is_temp) = ensure_wav(&source)?;
-        let out = diarize_file(&wav, num_speakers, threshold);
+        let out = diarize_file_with_engine(&wav, &engine_for_blocking, num_speakers, threshold);
         if is_temp {
             let _ = std::fs::remove_file(&wav);
         }
-        out.map(|result| (result, false))
+        out.map(|result| (result, false, std::collections::HashMap::new()))
     })
     .await
     .map_err(|e| format!("Diarization task failed: {}", e))?
@@ -888,8 +1223,15 @@ pub async fn diarize_meeting(
 
     // Load transcript segments with their recording-relative timings, plus any
     // label they already carry from live diarization.
-    let rows: Vec<(String, Option<f64>, Option<f64>, Option<String>)> = sqlx::query_as(
-        "SELECT id, audio_start_time, audio_end_time, speaker FROM transcripts WHERE meeting_id = ?",
+    let rows: Vec<(
+        String,
+        Option<f64>,
+        Option<f64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, audio_start_time, audio_end_time, speaker, transcript, timestamp FROM transcripts WHERE meeting_id = ? ORDER BY audio_start_time ASC, id ASC",
     )
     .bind(&meeting_id)
     .fetch_all(pool)
@@ -897,19 +1239,14 @@ pub async fn diarize_meeting(
     .map_err(|e| format!("Failed to read transcripts: {}", e))?;
 
     // Work out which of the freshly-clustered speakers is the local user.
-    //
-    // Live diarization could tell, because it saw mic-vs-system levels before
-    // mixing. This offline pass only has the mixed recording, so that signal is
-    // gone — but the live labels are still in the database. Whichever new
-    // speaker covers the most time that was previously marked "You" is the user.
     let user_ranges: Vec<(f32, f32)> = rows
         .iter()
-        .filter(|(_, _, _, spk)| {
+        .filter(|(_, _, _, spk, _, _)| {
             spk.as_deref()
                 .map(|s| s.eq_ignore_ascii_case("you"))
                 .unwrap_or(false)
         })
-        .filter_map(|(_, s, e, _)| match (s, e) {
+        .filter_map(|(_, s, e, _, _, _)| match (s, e) {
             (Some(s), Some(e)) if e > s => Some((*s as f32, *e as f32)),
             _ => None,
         })
@@ -935,20 +1272,107 @@ pub async fn diarize_meeting(
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(spk, _)| spk)
     };
-    let allow_remote_source_hint = num_speakers != Some(1);
 
     if let Some(u) = user_speaker {
         log::info!("🧑‍🤝‍🧑 Speaker {} identified as the local user", u + 1);
     }
 
-    // Assign each transcript from the offline source-track result. Custom names
-    // are preserved, but transient live labels (You/Guest/Speaker N) are refined.
-    // If multiple source-track speakers overlap the transcript, persist a label
-    // such as "You + Speaker 1" instead of falsely choosing only one voice.
+    // Names the user gave speakers (on transcript lines, or linked contacts)
+    // are matched to the new voice clusters, so a rerun carries each name to
+    // the rest of that person's lines instead of falling back to "Speaker N".
+    let registered_speakers: Vec<String> = sqlx::query_scalar(
+        "SELECT speaker_label FROM person_speakers WHERE meeting_id = ?",
+    )
+    .bind(&meeting_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let mut manual_speakers_ranges: std::collections::HashMap<String, Vec<(f32, f32)>> =
+        std::collections::HashMap::new();
+    for (_, s_opt, e_opt, spk_opt, _, _) in &rows {
+        if let (Some(s), Some(e), Some(spk)) = (s_opt, e_opt, spk_opt) {
+            if *e > *s {
+                for name in extract_manual_speaker_names(spk) {
+                    manual_speakers_ranges
+                        .entry(name)
+                        .or_default()
+                        .push((*s as f32, *e as f32));
+                }
+            }
+        }
+    }
+    for label in registered_speakers {
+        if is_manual_speaker_label(&label) {
+            manual_speakers_ranges.entry(label).or_default();
+        }
+    }
+
+    // Voice cluster index -> manual name (cluster 1 -> "Alice").
+    let mut cluster_to_manual_name: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
+    if !manual_speakers_ranges.is_empty() {
+        let mut cluster_overlaps: Vec<(usize, String, f32)> = Vec::new();
+        for spk in 0..result.num_speakers {
+            if Some(spk) == user_speaker {
+                continue;
+            }
+            for (name, ranges) in &manual_speakers_ranges {
+                let mut total_overlap = 0.0f32;
+                for seg in result.segments.iter().filter(|seg| seg.speaker == spk) {
+                    for (rs, re) in ranges {
+                        let ov = seg.end.min(*re) - seg.start.max(*rs);
+                        if ov > 0.0 {
+                            total_overlap += ov;
+                        }
+                    }
+                }
+                if total_overlap > 0.05 {
+                    cluster_overlaps.push((spk, name.clone(), total_overlap));
+                }
+            }
+        }
+        cluster_overlaps.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Pair clusters and names one-to-one, strongest overlap first.
+        let mut assigned_clusters = std::collections::HashSet::new();
+        let mut assigned_names = std::collections::HashSet::new();
+        for (spk, name, _) in &cluster_overlaps {
+            if !assigned_clusters.contains(spk) && !assigned_names.contains(name) {
+                cluster_to_manual_name.insert(*spk, name.clone());
+                assigned_clusters.insert(*spk);
+                assigned_names.insert(name.clone());
+            }
+        }
+        log::info!(
+            "🧑‍🤝‍🧑 Matched voice clusters to manual speaker names: {:?}",
+            cluster_to_manual_name
+        );
+    }
+
+    let speaker_label = |spk: usize| -> String {
+        if Some(spk) == user_speaker {
+            return "You".to_string();
+        }
+        // A name the user gave in this meeting wins over a voice-profile guess.
+        if let Some(manual_name) = cluster_to_manual_name.get(&spk) {
+            return manual_name.clone();
+        }
+        if let Some(name) = profile_names.get(&spk) {
+            return name.clone();
+        }
+        let display = match user_speaker {
+            Some(user) if spk > user => spk,
+            _ => spk + 1,
+        };
+        format!("Speaker {}", display)
+    };
+
     let mut assignments: Vec<(String, String)> = Vec::new();
     let mut updates: Vec<(String, Option<String>)> = Vec::new();
     let mut preserved = 0u32;
-    for (id, start, end, existing) in rows {
+
+    for (id, start, end, existing, _, _) in rows {
         if let Some(ref live) = existing {
             let live_trim = live.trim();
             if !live_trim.is_empty() {
@@ -974,109 +1398,154 @@ pub async fn diarize_meeting(
             }
         };
 
-        let mut overlap_by_speaker: std::collections::HashMap<usize, f32> =
-            std::collections::HashMap::new();
-        for seg in &result.segments {
-            let ov = seg.end.min(e) - seg.start.max(s);
-            if ov > 0.0 {
-                *overlap_by_speaker.entry(seg.speaker).or_insert(0.0) += ov;
-            }
-        }
+        // Generated labels are not durable capture-source provenance. Preserve
+        // source hints without excluding genuine simultaneous speakers.
+        let relevant_segments: Vec<&DiarizationSegment> = result
+            .segments
+            .iter()
+            .filter(|seg| {
+                let ov = seg.end.min(e) - seg.start.max(s);
+                ov > 0.0
+            })
+            .collect();
 
-        if !overlap_by_speaker.is_empty() {
-            let max_overlap = overlap_by_speaker
-                .values()
-                .copied()
-                .fold(0.0f32, f32::max);
-            // Keep genuine simultaneous speakers while dropping tiny boundary
-            // touches. 20% of the strongest overlap (min 80 ms) is meaningful.
-            let cutoff = (max_overlap * 0.20).max(0.08);
-            let mut speakers: Vec<(usize, f32)> = overlap_by_speaker.into_iter().collect();
-            speakers.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            if let Some(&(primary, _)) = speakers.first() {
-                speakers.retain(|(speaker, overlap)| {
-                    *speaker == primary
-                        || (*overlap >= cutoff
-                            && result.segments.iter().any(|a| {
-                                a.speaker == *speaker
-                                    && result.segments.iter().any(|b| {
-                                        b.speaker != a.speaker
-                                            && a.end.min(b.end).min(e)
-                                                - a.start.max(b.start).max(s)
-                                                >= 0.08
-                                    })
-                            }))
-                });
-            }
-
-            let speaker_label = |spk: usize| -> String {
-                if Some(spk) == user_speaker {
-                    return "You".to_string();
+        // Diarization updates labels only. Text length cannot establish word
+        // alignment, and reruns must preserve every transcript byte and timing.
+        {
+            let mut overlap_by_speaker: std::collections::HashMap<usize, f32> =
+                std::collections::HashMap::new();
+            for seg in &relevant_segments {
+                let ov = seg.end.min(e) - seg.start.max(s);
+                if ov > 0.0 {
+                    *overlap_by_speaker.entry(seg.speaker).or_insert(0.0) += ov;
                 }
-                // Keep remote numbering compact when the user owns a cluster.
-                let display = match user_speaker {
-                    Some(user) if spk > user => spk,
-                    _ => spk + 1,
-                };
-                format!("Speaker {}", display)
-            };
+            }
 
-            let mut labels: Vec<String> = speakers
-                .into_iter()
-                .take(3)
-                .map(|(spk, _)| speaker_label(spk))
-                .collect();
-            apply_source_track_hint(
-                existing.as_deref(),
-                used_source_tracks,
-                allow_remote_source_hint,
-                &mut labels,
-            );
-            labels.dedup();
-            labels.truncate(3);
-            let label = labels.join(" + ");
-            if label.is_empty() {
-                continue;
+            if let Some((&primary, _)) = overlap_by_speaker
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            {
+                let cutoff = (overlap_by_speaker[&primary] * 0.20).max(0.08);
+                let mut speakers = vec![primary];
+                for (&other, &other_ov) in &overlap_by_speaker {
+                    if other != primary && other_ov >= cutoff {
+                        let has_simultaneous = relevant_segments.iter().any(|a| {
+                            a.speaker == primary
+                                && relevant_segments.iter().any(|b| {
+                                    b.speaker == other
+                                        && a.end.min(b.end).min(e) - a.start.max(b.start).max(s)
+                                            >= 0.08
+                                })
+                        });
+                        if has_simultaneous {
+                            speakers.push(other);
+                        }
+                    }
+                }
+
+                speakers.sort_unstable();
+                let mut labels: Vec<_> = speakers.into_iter().map(&speaker_label).collect();
+                apply_source_track_hint(existing.as_deref(), used_source_tracks, num_speakers != Some(1), &mut labels);
+                labels.dedup();
+                labels.truncate(3);
+                let final_label = labels.join(" + ");
+                updates.push((id.clone(), Some(final_label.clone())));
+                assignments.push((id, final_label));
+            } else {
+                // No voice overlaps this line: keep the source hint, or else the
+                // label it already had, rather than clearing it.
+                let mut labels = Vec::new();
+                apply_source_track_hint(existing.as_deref(), used_source_tracks, num_speakers != Some(1), &mut labels);
+                let fallback = (!labels.is_empty()).then(|| labels.join(" + ")).or_else(|| {
+                    existing
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|label| !label.is_empty())
+                        .map(str::to_string)
+                });
+                if let Some(label) = &fallback {
+                    preserved += 1;
+                    assignments.push((id.clone(), label.clone()));
+                }
+                updates.push((id, fallback));
             }
-            updates.push((id.clone(), Some(label.clone())));
-            assignments.push((id, label));
-        } else {
-            let source_hint = existing
-                .as_deref()
-                .filter(|speaker| {
-                    used_source_tracks
-                        && (speaker.eq_ignore_ascii_case("you")
-                            || (allow_remote_source_hint
-                                && speaker.eq_ignore_ascii_case("guest")))
-                })
-                .map(str::to_string);
-            if let Some(ref label) = source_hint {
-                assignments.push((id.clone(), label.clone()));
-            }
-            updates.push((id, source_hint));
         }
     }
-    let mut tx = pool
-        .begin()
+
+    persist_speaker_labels(pool, &meeting_id, updates).await.map_err(|e| format!("Failed to save speaker labels: {e}"))?;
+
+    // Link contacts whose saved voice profile named a cluster in this meeting.
+    // The labels are already saved, so a voice whose contact is gone is
+    // skipped and a failed link never fails the rerun.
+    let used_names: std::collections::HashSet<&str> = assignments.iter().map(|(_, label)| label.as_str()).collect();
+    for (name, person_id) in voice_profiles::active_person_links() {
+        if !used_names.contains(name.as_str()) {
+            continue;
+        }
+        if let Err(error) = sqlx::query(
+            "INSERT OR IGNORE INTO person_speakers (person_id, meeting_id, speaker_label) \
+             SELECT id, ?, ? FROM people WHERE id = ?",
+        )
+        .bind(&meeting_id)
+        .bind(&name)
+        .bind(&person_id)
+        .execute(pool)
         .await
-        .map_err(|e| format!("Failed to begin speaker update: {e}"))?;
-    for (id, label) in updates {
-        sqlx::query("UPDATE transcripts SET speaker = ? WHERE id = ?")
-            .bind(label)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| format!("Failed to save speaker label: {e}"))?;
+        {
+            log::warn!("Could not link a matched voice to its contact: {error}");
+        }
     }
-    tx.commit()
-        .await
-        .map_err(|e| format!("Failed to commit speaker labels: {e}"))?;
+
+    // Keep contacts linked to the names the rerun carried forward.
+    if !cluster_to_manual_name.is_empty() {
+        let mut person_tx = pool
+            .begin()
+            .await
+            .map_err(|e| format!("Failed to begin person reconciliation: {e}"))?;
+        for manual_name in cluster_to_manual_name.values() {
+            if crate::database::repositories::person::is_person_name(manual_name) {
+                let _ = crate::database::repositories::person::PeopleRepository::reconcile_speaker_identity(
+                    &mut person_tx,
+                    &meeting_id,
+                    manual_name,
+                    manual_name,
+                )
+                .await;
+            }
+        }
+        let _ = person_tx.commit().await;
+    }
+
+    // Mirror the new labels into the meeting folder's transcripts.json.
+    if let Some(ref folder) = folder_path {
+        let p = PathBuf::from(folder);
+        if p.is_dir() {
+            if let Ok(db_transcripts) = sqlx::query_as::<_, (String, String, String, Option<f64>, Option<f64>, Option<f64>, Option<String>)>(
+                "SELECT id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker FROM transcripts WHERE meeting_id = ? ORDER BY audio_start_time ASC"
+            )
+            .bind(&meeting_id)
+            .fetch_all(pool)
+            .await
+            {
+                let segments_to_write: Vec<crate::api::TranscriptSegment> = db_transcripts
+                    .into_iter()
+                    .map(|(tid, text, ts, s, e, d, spk)| crate::api::TranscriptSegment {
+                        id: tid,
+                        text,
+                        timestamp: ts,
+                        audio_start_time: s,
+                        audio_end_time: e,
+                        duration: d,
+                        speaker: spk,
+                    })
+                    .collect();
+                let _ = crate::audio::common::write_transcripts_json(&p, &segments_to_write);
+            }
+        }
+    }
     if preserved > 0 {
         log::info!(
-            "🧑‍🤝‍🧑 Preserved {} live speaker label(s); offline only filled gaps",
+            "🧑‍🤝‍🧑 Kept {} existing speaker label(s): named by the user, or no voice overlap",
             preserved
         );
     }
@@ -1093,6 +1562,20 @@ pub async fn diarize_meeting(
         labeled: assignments.len(),
         assignments,
     })
+}
+
+async fn persist_speaker_labels(
+    pool: &sqlx::SqlitePool,
+    meeting_id: &str,
+    updates: Vec<(String, Option<String>)>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    for (id, label) in updates {
+        sqlx::query("UPDATE transcripts SET speaker = ? WHERE id = ? AND meeting_id = ?")
+            .bind(label).bind(id).bind(meeting_id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Slide the analysis window over samples, decode segmentation and
@@ -1199,9 +1682,57 @@ fn collect_turns(models: &mut DiarizationModels, samples: &[f32]) -> Result<Vec<
     Ok(turns)
 }
 
+fn apply_source_track_hint(
+    existing: Option<&str>,
+    used_source_tracks: bool,
+    allow_remote_hint: bool,
+    labels: &mut Vec<String>,
+) {
+    if !used_source_tracks {
+        return;
+    }
+    match existing {
+        Some(speaker) if speaker.eq_ignore_ascii_case("you") => {
+            labels.retain(|label| !label.eq_ignore_ascii_case("you"));
+            labels.insert(0, "You".to_string());
+        }
+        Some(speaker) if allow_remote_hint && speaker.eq_ignore_ascii_case("guest") => {
+            let has_remote = labels.iter().any(|label| {
+                !label.eq_ignore_ascii_case("you") && !label.eq_ignore_ascii_case("guest")
+            });
+            if !has_remote && !labels.iter().any(|label| label.eq_ignore_ascii_case("guest")) {
+                labels.push("Guest".to_string());
+            }
+        }
+        _ => {}
+    }
+    if let Some(position) = labels.iter().position(|label| label.eq_ignore_ascii_case("you")) {
+        let user = labels.remove(position);
+        labels.insert(0, user);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn label_reruns_preserve_text_timing_and_rollback_as_a_unit() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE transcripts(id TEXT PRIMARY KEY, meeting_id TEXT, transcript TEXT, audio_start_time REAL, audio_end_time REAL, speaker TEXT CHECK(speaker != 'invalid'))").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO transcripts VALUES ('a','m','Hello. 世界! Second turn.',1.25,9.5,'Guest'),('a-split-1','m','Retain this old row too.',9.5,12.0,'Guest'),('other','other','Private other meeting',0,1,'Named')").execute(&pool).await.unwrap();
+        for label in ["Speaker 1", "You + Speaker 2"] {
+            persist_speaker_labels(&pool,"m",vec![("a".into(),Some(label.into())),("other".into(),Some(label.into()))]).await.unwrap();
+        }
+        let rows: Vec<(String,String,f64,f64)> = sqlx::query_as("SELECT id,transcript,audio_start_time,audio_end_time FROM transcripts ORDER BY id").fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(),3);
+        assert_eq!(rows[0],("a".into(),"Hello. 世界! Second turn.".into(),1.25,9.5));
+        assert_eq!(rows[1].1,"Retain this old row too.");
+        let failed = persist_speaker_labels(&pool,"m",vec![("a".into(),Some("Speaker 3".into())),("a-split-1".into(),Some("invalid".into()))]).await;
+        assert!(failed.is_err());
+        let labels: Vec<String> = sqlx::query_scalar("SELECT speaker FROM transcripts ORDER BY id").fetch_all(&pool).await.unwrap();
+        assert_eq!(labels,vec!["You + Speaker 2","Guest","Named"]);
+    }
 
     #[test]
     fn dual_track_user_hint_survives_missing_mic_segmentation() {

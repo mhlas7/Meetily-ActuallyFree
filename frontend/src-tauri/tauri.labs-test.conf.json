@@ -1,0 +1,7 @@
+{
+  "productName": "Meetily Labs Local Test",
+  "identifier": "com.meetily.labs-test",
+  "bundle": {
+    "createUpdaterArtifacts": false
+  }
+}

@@ -1,14 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { Spinner } from '@/components/ui/spinner';
 import { invoke } from '@tauri-apps/api/core';
-import { BookOpen, Check, CheckCircle2, ChevronDown, Clock3, Languages, Loader2, Radio, Zap } from 'lucide-react';
+import { OPTIONAL_MODEL_PREFERENCES_CHANGED } from '@/lib/optional-model-activation';
+import { useOptionalModelDownloads } from '@/contexts/OptionalModelDownloadsContext';
+import { BookOpen, Check, CheckCircle2, ChevronDown, Clock3, Languages, Radio, Zap } from 'lucide-react';
 import { toast } from 'sonner';
 import { Textarea } from './ui/textarea';
 import { Button } from './ui/button';
 import { Label } from './ui/label';
+import { Switch } from './ui/switch';
+import { RecordingPreferences } from './RecordingSettings';
 import { ModelManager } from './WhisperModelManager';
 import { ParakeetModelManager } from './ParakeetModelManager';
 import type { RawModelInfo } from '@/hooks/useTranscriptionModels';
 import { isVisibleParakeetModel } from '@/lib/parakeet';
+import { useLabs } from '@/hooks/useLabs';
 
 export interface TranscriptModelProps {
     provider: 'localWhisper' | 'parakeet' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
@@ -43,6 +49,9 @@ const DEFAULT_POST_CALL_CONFIG: PostCallTranscriptConfig = {
 };
 
 export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelConfig, onModelSelect }: TranscriptSettingsProps) {
+    const { jobs } = useOptionalModelDownloads();
+    const whisperJob = jobs.whisper;
+    const isWhisperDownloading = whisperJob.status === 'downloading' || whisperJob.status === 'activating';
     const [uiProvider, setUiProvider] = useState<TranscriptModelProps['provider']>(transcriptModelConfig.provider);
     const [whisperManagerOpen, setWhisperManagerOpen] = useState(false);
     const [installedModels, setInstalledModels] = useState<InstalledModel[]>([]);
@@ -56,11 +65,52 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const [isSavingVocabulary, setIsSavingVocabulary] = useState(false);
     const [vocabularySaved, setVocabularySaved] = useState(false);
     const [vocabularyError, setVocabularyError] = useState<string | null>(null);
+    const [realTimeTranscription, setRealTimeTranscription] = useState(false);
+    // Labs speech options that are on are named on the engine they change.
+    const { labs } = useLabs();
     const vocabularyRevisionRef = useRef(0);
     const liveSaveInFlightRef = useRef(false);
     const postCallSaveInFlightRef = useRef(false);
     const postCallRevisionRef = useRef(0);
     const postCallSectionRef = useRef<HTMLDivElement>(null);
+
+    useEffect(() => {
+        let disposed = false;
+        const refreshPostCall = () => {
+            if (postCallSaveInFlightRef.current) return;
+            const revision = ++postCallRevisionRef.current;
+            void invoke<PostCallTranscriptConfig>('api_get_post_call_transcript_config').then(config => {
+                if (!disposed && revision === postCallRevisionRef.current) {
+                    setPostCallConfig(config);
+                    setPostCallError(null);
+                }
+            }).catch(error => console.error('Could not refresh activated post-call model:', error));
+        };
+        window.addEventListener(OPTIONAL_MODEL_PREFERENCES_CHANGED, refreshPostCall);
+        return () => { disposed = true; window.removeEventListener(OPTIONAL_MODEL_PREFERENCES_CHANGED, refreshPostCall); };
+    }, []);
+
+    useEffect(() => {
+        invoke<RecordingPreferences>('get_recording_preferences')
+            .then((p) => setRealTimeTranscription(p.real_time_transcription ?? false))
+            .catch(() => {});
+    }, []);
+
+    const handleToggleRealTime = async (checked: boolean) => {
+        setRealTimeTranscription(checked);
+        try {
+            const prefs = await invoke<RecordingPreferences>('get_recording_preferences');
+            await invoke('set_recording_preferences', { preferences: { ...prefs, real_time_transcription: checked } });
+            toast.success(checked ? 'Faster transcription enabled' : 'Standard transcription enabled', {
+                description: checked
+                    ? 'Audio chunks will be streamed ~3.5s with rapid pause detection.'
+                    : 'Audio chunks will use standard pause detection.'
+            });
+        } catch (e) {
+            console.error('Failed to update real-time transcription preference:', e);
+            toast.error('Failed to update streaming preference');
+        }
+    };
 
     const refreshInstalledModels = useCallback(async () => {
         const [whisperModels, parakeetModels] = await Promise.all([
@@ -81,6 +131,12 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         setUiProvider(transcriptModelConfig.provider);
     }, [transcriptModelConfig.provider]);
 
+    // Setup downloads can finish while this Settings page remains mounted.
+    // Refresh installed choices as well as the preference-change subscription.
+    useEffect(() => {
+        if (whisperJob.status === 'ready' || whisperJob.status === 'idle' || whisperJob.status === 'activation-error') void refreshInstalledModels();
+    }, [whisperJob.status, refreshInstalledModels]);
+
     useEffect(() => {
         const requestedSection = sessionStorage.getItem('meetily-settings-transcription-section');
         sessionStorage.removeItem('meetily-settings-transcription-section');
@@ -93,8 +149,9 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
 
     useEffect(() => {
         void refreshInstalledModels();
+        const revision = postCallRevisionRef.current;
         invoke<PostCallTranscriptConfig>('api_get_post_call_transcript_config')
-            .then((config) => setPostCallConfig(config || DEFAULT_POST_CALL_CONFIG))
+            .then((config) => { if (revision === postCallRevisionRef.current) setPostCallConfig(config || DEFAULT_POST_CALL_CONFIG); })
             .catch((error) => {
                 console.error('Failed to load post-call transcription config:', error);
                 setPostCallError('Could not load the post-call model preference.');
@@ -161,6 +218,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                 provider: nextConfig.provider,
                 model: nextConfig.model,
             });
+            window.dispatchEvent(new Event(OPTIONAL_MODEL_PREFERENCES_CHANGED));
             if (postCallRevisionRef.current === revision) {
                 setPostCallSaved(true);
                 window.setTimeout(() => setPostCallSaved(false), 2000);
@@ -249,9 +307,9 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
 
     return (
         <div className="space-y-6 pb-6">
-            <section className="space-y-4 rounded-xl border border-[var(--af-border)] bg-[var(--af-panel-2)] p-4 text-[var(--af-text)] sm:p-5">
+            <section className="space-y-4 rounded-2xl border border-af-border bg-af-panel-2/40 p-5 text-af-text">
                 <div className="flex items-start gap-3">
-                    <Radio className="mt-0.5 h-5 w-5 shrink-0 text-blue-500" />
+                    <Radio className="mt-0.5 h-5 w-5 shrink-0 text-af-accent" />
                     <div className="min-w-0 flex-1">
                         <h3 className="font-semibold">Live transcription</h3>
                         <p className="mt-1 text-sm text-muted-foreground">
@@ -262,7 +320,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
 
                 <div
                     className={`space-y-4 rounded-xl border p-4 transition-colors ${installedParakeetModel && !isSavingLive ? 'cursor-pointer hover:border-[var(--af-accent)]' : ''} ${uiProvider === 'parakeet'
-                    ? 'border-[var(--af-accent)] bg-[var(--af-accent-soft)] ring-1 ring-blue-500/20'
+                    ? 'border-[var(--af-accent)] bg-[var(--af-accent-soft)] ring-1 ring-af-accent/50'
                     : 'border-[var(--af-border-strong)] bg-[var(--af-panel-2)]'}`}
                     role={installedParakeetModel ? 'button' : undefined}
                     tabIndex={installedParakeetModel ? 0 : undefined}
@@ -281,13 +339,18 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                 >
                     <div className="flex flex-wrap items-start justify-between gap-3">
                         <div className="flex min-w-0 items-start gap-3">
-                            <Zap className="mt-0.5 h-5 w-5 shrink-0 text-amber-400" />
+                            <Zap className="mt-0.5 h-5 w-5 shrink-0 text-af-warning" />
                             <div>
                                 <div className="flex flex-wrap items-center gap-2">
                                     <h4 className="font-semibold">Parakeet</h4>
-                                    <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-500">
+                                    <span className="rounded-full bg-af-success/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-af-success">
                                         Recommended for live
                                     </span>
+                                    {labs.parakeetGpu && (
+                                        <span className="rounded-full border border-af-accent/30 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-af-accent">
+                                            GPU · Labs
+                                        </span>
+                                    )}
                                 </div>
                                 <p className="mt-1 text-sm text-[var(--af-text-2)]">
                                     Best for live meetings: lower latency, lighter resource use, and strong real-time accuracy. Parakeet does not support custom vocabulary hints.
@@ -295,7 +358,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                             </div>
                         </div>
                         {uiProvider === 'parakeet' ? (
-                            <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-blue-500/40 bg-blue-500/10 px-2.5 py-1 text-xs font-medium text-blue-400">
+                            <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-af-accent/40 bg-af-accent/10 px-2.5 py-1 text-xs font-medium text-af-accent">
                                 <CheckCircle2 className="h-3.5 w-3.5" /> Selected for live
                             </span>
                         ) : installedParakeetModel ? (
@@ -317,7 +380,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
 
                 <div
                     className={`space-y-4 rounded-xl border p-4 transition-colors ${liveWhisperModel && !isSavingLive ? 'cursor-pointer hover:border-[var(--af-accent)]' : ''} ${uiProvider === 'localWhisper'
-                    ? 'border-[var(--af-accent)] bg-[var(--af-accent-soft)] ring-1 ring-blue-500/20'
+                    ? 'border-[var(--af-accent)] bg-[var(--af-accent-soft)] ring-1 ring-af-accent/50'
                     : 'border-[var(--af-border-strong)] bg-[var(--af-panel-2)]'}`}
                     role={liveWhisperModel ? 'button' : undefined}
                     tabIndex={liveWhisperModel ? 0 : undefined}
@@ -336,13 +399,18 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                 >
                     <div className="flex flex-wrap items-start justify-between gap-3">
                         <div className="flex min-w-0 items-start gap-3">
-                            <Languages className="mt-0.5 h-5 w-5 shrink-0 text-violet-400" />
+                            <Languages className="mt-0.5 h-5 w-5 shrink-0 text-af-accent" />
                             <div>
                                 <div className="flex flex-wrap items-center gap-2">
                                     <h4 className="font-semibold">Whisper</h4>
-                                    <span className="rounded-full bg-violet-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-violet-400">
+                                    <span className="rounded-full bg-af-accent/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-af-accent">
                                         Better for post-call
                                     </span>
+                                    {labs.whisperSilenceGuard && (
+                                        <span className="rounded-full border border-af-accent/30 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-af-accent">
+                                            Silence guard · Labs
+                                        </span>
+                                    )}
                                 </div>
                                 <p className="mt-1 text-sm text-[var(--af-text-2)]">
                                     Best as a post-call second pass. Whisper is slower and heavier during live meetings, but supports vocabulary hints, manual language selection, and broad multilingual transcription.
@@ -350,7 +418,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                             </div>
                         </div>
                         {uiProvider === 'localWhisper' ? (
-                            <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-blue-500/40 bg-blue-500/10 px-2.5 py-1 text-xs font-medium text-blue-400">
+                            <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-af-accent/40 bg-af-accent/10 px-2.5 py-1 text-xs font-medium text-af-accent">
                                 <CheckCircle2 className="h-3.5 w-3.5" /> Selected for live
                             </span>
                         ) : liveWhisperModel ? (
@@ -372,11 +440,32 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                         </Button>
                     )}
                 </div>
+
+                {/* Faster Transcription Toggle */}
+                <div className="flex items-center justify-between gap-3 rounded-xl border border-[var(--af-border-strong)] bg-[var(--af-panel)] p-4">
+                    <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2 font-semibold">
+                            <Zap className="h-4 w-4 text-af-warning" />
+                            Faster transcription
+                        </div>
+                        <p className="mt-1 text-xs text-[var(--af-text-2)]">
+                            Streams transcript chunks frequently (~3.5s with rapid 350ms pause detection) for lower latency.
+                        </p>
+                        <p className="mt-1.5 text-xs text-af-warning font-medium">
+                            Disclaimer: This may cause additional speakers to show up when using diarization.
+                        </p>
+                    </div>
+                    <Switch
+                        checked={realTimeTranscription}
+                        onCheckedChange={handleToggleRealTime}
+                        className="shrink-0"
+                    />
+                </div>
             </section>
 
-            <section ref={postCallSectionRef} className="scroll-mt-6 space-y-4 rounded-xl border border-[var(--af-border)] bg-[var(--af-panel-2)] p-4 text-[var(--af-text)] sm:p-5">
+            <section ref={postCallSectionRef} className="scroll-mt-6 space-y-4 rounded-2xl border border-af-border bg-af-panel-2/40 p-5 text-af-text">
                 <div className="flex items-start gap-3">
-                    <Clock3 className="mt-0.5 h-5 w-5 shrink-0 text-violet-500" />
+                    <Clock3 className="mt-0.5 h-5 w-5 shrink-0 text-af-accent" />
                     <div className="min-w-0 flex-1">
                         <h3 className="font-semibold">Post-call retranscription</h3>
                         <p className="mt-1 text-sm text-muted-foreground">
@@ -387,7 +476,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
 
                 <div
                     className={`space-y-3 rounded-xl border p-4 transition-colors ${postCallWhisperModel && !isLoadingPostCall && !isSavingPostCall ? 'cursor-pointer hover:border-[var(--af-accent)]' : ''} ${effectivePostCallProvider === 'whisper'
-                    ? 'border-[var(--af-accent)] bg-[var(--af-accent-soft)] ring-1 ring-blue-500/20'
+                    ? 'border-[var(--af-accent)] bg-[var(--af-accent-soft)] ring-1 ring-af-accent/50'
                     : 'border-[var(--af-border-strong)] bg-[var(--af-panel-2)]'}`}
                     role={postCallWhisperModel ? 'button' : undefined}
                     tabIndex={postCallWhisperModel ? 0 : undefined}
@@ -406,16 +495,21 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                 >
                     <div className="flex flex-wrap items-start justify-between gap-3">
                         <div className="flex min-w-0 items-start gap-3">
-                            <Languages className="mt-0.5 h-5 w-5 shrink-0 text-violet-400" />
+                            <Languages className="mt-0.5 h-5 w-5 shrink-0 text-af-accent" />
                             <div>
                                 <div className="flex flex-wrap items-center gap-2">
                                     <h4 className="font-semibold">Whisper</h4>
-                                    <span className="rounded-full bg-violet-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-violet-400">
+                                    <span className="rounded-full bg-af-accent/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-af-accent">
                                         Recommended for post-call
                                     </span>
-                                    <span className="rounded-full bg-blue-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-blue-400">
+                                    <span className="rounded-full bg-af-accent/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-af-accent">
                                         Vocabulary hints
                                     </span>
+                                    {labs.whisperSilenceGuard && (
+                                        <span className="rounded-full border border-af-accent/30 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-af-accent">
+                                            Silence guard · Labs
+                                        </span>
+                                    )}
                                 </div>
                                 <p className="mt-1 text-sm text-[var(--af-text-2)]">
                                     Best for post-call quality. Whisper is slower and uses more resources, but can improve difficult names, jargon, and multilingual audio. It uses your global vocabulary hints below to guide names, acronyms, and technical terms.
@@ -423,7 +517,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                             </div>
                         </div>
                         {effectivePostCallProvider === 'whisper' ? (
-                            <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-blue-500/40 bg-blue-500/10 px-2.5 py-1 text-xs font-medium text-blue-400">
+                            <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-af-accent/40 bg-af-accent/10 px-2.5 py-1 text-xs font-medium text-af-accent">
                                 <CheckCircle2 className="h-3.5 w-3.5" /> Selected for post-call
                             </span>
                         ) : postCallWhisperModel ? (
@@ -432,7 +526,17 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                             </span>
                         ) : null}
                     </div>
-                    {postCallWhisperModel ? (
+                    {isWhisperDownloading ? (
+                        <div className="space-y-2 border-t border-af-border pt-3">
+                            <div className="flex flex-wrap items-center justify-between gap-2 text-sm font-medium">
+                                <span>{whisperJob.status === 'activating' ? 'Enabling model…' : 'Downloading Whisper…'}</span>
+                                <span className="tabular-nums">{Math.round(whisperJob.progress)}%</span>
+                            </div>
+                            <div role="progressbar" aria-label="Whisper download progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={whisperJob.progress} className="h-1.5 overflow-hidden rounded-full bg-af-hover">
+                                <div className="h-full rounded-full bg-af-accent transition-[width] duration-150" style={{ width: `${whisperJob.progress}%` }} />
+                            </div>
+                        </div>
+                    ) : postCallWhisperModel ? (
                         <p className="text-xs text-[var(--af-text-3)]">
                             Uses Whisper: {postCallWhisperModel.name}. Change the specific model under Manage Whisper models below.
                         </p>
@@ -448,7 +552,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
 
                 <div
                     className={`space-y-3 rounded-xl border p-4 transition-colors ${installedParakeetModel && !isLoadingPostCall && !isSavingPostCall ? 'cursor-pointer hover:border-[var(--af-accent)]' : ''} ${effectivePostCallProvider === 'parakeet'
-                    ? 'border-[var(--af-accent)] bg-[var(--af-accent-soft)] ring-1 ring-blue-500/20'
+                    ? 'border-[var(--af-accent)] bg-[var(--af-accent-soft)] ring-1 ring-af-accent/50'
                     : 'border-[var(--af-border-strong)] bg-[var(--af-panel-2)]'}`}
                     role={installedParakeetModel ? 'button' : undefined}
                     tabIndex={installedParakeetModel ? 0 : undefined}
@@ -467,13 +571,18 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                 >
                     <div className="flex flex-wrap items-start justify-between gap-3">
                         <div className="flex min-w-0 items-start gap-3">
-                            <Zap className="mt-0.5 h-5 w-5 shrink-0 text-amber-400" />
+                            <Zap className="mt-0.5 h-5 w-5 shrink-0 text-af-warning" />
                             <div>
                                 <div className="flex flex-wrap items-center gap-2">
                                     <h4 className="font-semibold">Parakeet</h4>
-                                    <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-500">
+                                    <span className="rounded-full bg-af-success/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-af-success">
                                         Fast and accurate
                                     </span>
+                                    {labs.parakeetGpu && (
+                                        <span className="rounded-full border border-af-accent/30 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-af-accent">
+                                            GPU · Labs
+                                        </span>
+                                    )}
                                 </div>
                                 <p className="mt-1 text-sm text-[var(--af-text-2)]">
                                     Finishes post-call enhancement sooner and uses fewer resources while maintaining strong accuracy. It does not use global vocabulary hints.
@@ -481,7 +590,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                             </div>
                         </div>
                         {effectivePostCallProvider === 'parakeet' ? (
-                            <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-blue-500/40 bg-blue-500/10 px-2.5 py-1 text-xs font-medium text-blue-400">
+                            <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-af-accent/40 bg-af-accent/10 px-2.5 py-1 text-xs font-medium text-af-accent">
                                 <CheckCircle2 className="h-3.5 w-3.5" /> Selected for post-call
                             </span>
                         ) : installedParakeetModel ? (
@@ -496,9 +605,9 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
 
                 <div className="min-h-5 text-xs">
                     {postCallError ? (
-                        <span className="text-red-500">{postCallError}</span>
+                        <span className="text-af-danger">{postCallError}</span>
                     ) : postCallSaved ? (
-                        <span className="inline-flex items-center gap-1 text-emerald-600"><Check className="h-3.5 w-3.5" /> Post-call default saved</span>
+                        <span className="inline-flex items-center gap-1 text-af-success"><Check className="h-3.5 w-3.5" /> Post-call default saved</span>
                     ) : postCallConfig.provider === 'live' ? (
                         <span className="text-[var(--af-text-3)]">This currently follows your live model. Choosing either card makes post-call selection independent.</span>
                     ) : null}
@@ -525,7 +634,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
 
             <section className={`space-y-3 rounded-xl border border-[var(--af-border)] bg-[var(--af-panel-2)] p-4 text-[var(--af-text)] ${whisperIsActive ? '' : 'opacity-60'}`}>
                 <div className="flex items-start gap-3">
-                    <BookOpen className={`mt-0.5 h-4 w-4 shrink-0 ${whisperIsActive ? 'text-blue-500' : 'text-muted-foreground'}`} />
+                    <BookOpen className={`mt-0.5 h-4 w-4 shrink-0 ${whisperIsActive ? 'text-af-accent' : 'text-muted-foreground'}`} />
                     <div className="min-w-0 flex-1">
                         <div className="flex flex-wrap items-center gap-2">
                             <Label htmlFor="whisper-vocabulary" className="text-sm font-medium">Global vocabulary hints</Label>
@@ -558,15 +667,15 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                 <div className="flex items-center justify-between gap-3">
                     <div className="min-h-5 text-xs">
                         {vocabularyError ? (
-                            <span className="text-red-500">{vocabularyError}</span>
+                            <span className="text-af-danger">{vocabularyError}</span>
                         ) : vocabularySaved ? (
-                            <span className="inline-flex items-center gap-1 text-emerald-600"><Check className="h-3.5 w-3.5" /> Saved</span>
+                            <span className="inline-flex items-center gap-1 text-af-success"><Check className="h-3.5 w-3.5" /> Saved</span>
                         ) : (
                             <span className="text-muted-foreground">{vocabulary.length}/1000 characters</span>
                         )}
                     </div>
                     <Button type="button" size="sm" onClick={saveVocabulary} disabled={isSavingVocabulary || !whisperIsActive}>
-                        {isSavingVocabulary && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                        {isSavingVocabulary && <Spinner className="mr-2 h-4 w-4 " />}
                         Save vocabulary
                     </Button>
                 </div>

@@ -36,6 +36,8 @@ pub struct Meeting {
     /// Approx length of the meeting in seconds (from last transcript end time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,6 +86,8 @@ pub struct ModelConfig {
     pub ollama_endpoint: Option<String>,
     #[serde(rename = "summaryMaxTokens")]
     pub summary_max_tokens: Option<i64>,
+    #[serde(rename = "claudeCliPath")]
+    pub claude_cli_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -367,7 +371,27 @@ pub async fn api_get_meetings<R: Runtime>(
         Ok(meeting_models) => {
             log_info!("Successfully got {} meetings", meeting_models.len());
 
-            // Duration = furthest audio_end_time on any transcript for that meeting.
+            // Duration = furthest audio_end_time on any transcript for that
+            // meeting. One grouped query keeps large libraries fast.
+            let durations: HashMap<String, f64> = sqlx::query_as::<_, (String, Option<f64>)>(
+                "SELECT meeting_id, MAX(COALESCE(audio_end_time, audio_start_time + COALESCE(duration, 0))) \
+                 FROM transcripts GROUP BY meeting_id",
+            )
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("Failed to read meeting durations: {}", e))?
+            .into_iter()
+            .filter_map(|(id, seconds)| seconds.map(|seconds| (id, seconds)))
+            .collect();
+            let groups: HashMap<String, String> =
+                sqlx::query_as::<_, (String, Option<String>)>("SELECT id, group_id FROM meetings")
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| format!("Failed to read meeting groups: {}", e))?
+                    .into_iter()
+                    .filter_map(|(id, group)| group.map(|group| (id, group)))
+                    .collect();
+
             let mut result: Vec<Meeting> = Vec::with_capacity(meeting_models.len());
             for m in meeting_models {
                 let metadata_started_at = m.folder_path.as_deref().and_then(|folder| {
@@ -383,20 +407,12 @@ pub async fn api_get_meetings<R: Runtime>(
                         .await
                         .map_err(|e| format!("Failed to repair meeting start time: {}", e))?;
                 }
-                let duration_seconds: Option<f64> = sqlx::query_scalar(
-                    "SELECT MAX(COALESCE(audio_end_time, audio_start_time + COALESCE(duration, 0))) FROM transcripts WHERE meeting_id = ?",
-                )
-                .bind(&m.id)
-                .fetch_one(pool)
-                .await
-                .ok()
-                .flatten();
-
                 result.push(Meeting {
+                    duration_seconds: durations.get(&m.id).copied(),
+                    group_id: groups.get(&m.id).cloned(),
                     id: m.id,
                     title: m.title,
                     created_at: Some(created_at.to_rfc3339()),
-                    duration_seconds,
                 });
             }
             result.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -407,6 +423,77 @@ pub async fn api_get_meetings<R: Runtime>(
             Err(e.to_string())
         }
     }
+}
+
+/// Audio files that belong to a meeting, for in-app playback.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingAudio {
+    /// Mixed playback track (`audio.mp4`, or the imported file).
+    pub path: Option<String>,
+    pub mic_path: Option<String>,
+    pub system_path: Option<String>,
+}
+
+const PLAYABLE_EXTENSIONS: [&str; 8] = ["mp4", "m4a", "mp3", "wav", "aac", "flac", "ogg", "webm"];
+
+/// Locates a meeting's recordings and lets the webview stream them through
+/// the asset protocol. Recordings can live in any folder the user picked, so
+/// the folder is added to the asset scope on demand rather than up front.
+#[tauri::command]
+pub async fn api_get_meeting_audio<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+) -> Result<MeetingAudio, String> {
+    use tauri::Manager;
+
+    let none = MeetingAudio {
+        path: None,
+        mic_path: None,
+        system_path: None,
+    };
+    let folder: Option<String> = sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
+        .bind(&meeting_id)
+        .fetch_optional(state.db_manager.pool())
+        .await
+        .map_err(|e| format!("Failed to look up the meeting folder: {}", e))?
+        .flatten();
+    let Some(folder) = folder else { return Ok(none) };
+    let dir = std::path::PathBuf::from(folder);
+    if !dir.is_dir() {
+        return Ok(none);
+    }
+
+    let existing = |name: &str| {
+        let path = dir.join(name);
+        path.is_file().then(|| path.to_string_lossy().to_string())
+    };
+    let playback = existing("audio.mp4").or_else(|| {
+        std::fs::read_dir(&dir).ok().and_then(|entries| {
+            entries.filter_map(Result::ok).map(|entry| entry.path()).find(|path| {
+                path.is_file()
+                    && path.file_stem().and_then(|stem| stem.to_str()) == Some("audio")
+                    && path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| PLAYABLE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+                        .unwrap_or(false)
+            })
+        })
+        .map(|path| path.to_string_lossy().to_string())
+    });
+    let audio = MeetingAudio {
+        path: playback,
+        mic_path: existing("mic.mp4"),
+        system_path: existing("system.mp4"),
+    };
+    if audio.path.is_some() || audio.mic_path.is_some() || audio.system_path.is_some() {
+        app.asset_protocol_scope()
+            .allow_directory(&dir, false)
+            .map_err(|e| format!("Failed to allow playback of the recording: {}", e))?;
+    }
+    Ok(audio)
 }
 
 #[tauri::command]
@@ -548,6 +635,7 @@ pub async fn api_get_model_config<R: Runtime>(
                         api_key,
                         ollama_endpoint: config.ollama_endpoint,
                         summary_max_tokens: config.summary_max_tokens,
+                        claude_cli_path: config.claude_cli_path,
                     }))
                 }
                 Err(e) => {
@@ -581,15 +669,17 @@ pub async fn api_save_model_config<R: Runtime>(
     api_key: Option<String>,
     ollama_endpoint: Option<String>,
     summary_max_tokens: Option<i64>,
+    claude_cli_path: Option<String>,
     _auth_token: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_info!(
-        "💾 api_save_model_config called (native): provider='{}', model='{}', whisperModel='{}', ollamaEndpoint={:?}, summaryMaxTokens={:?}",
+        "💾 api_save_model_config called (native): provider='{}', model='{}', whisperModel='{}', ollamaEndpoint={:?}, summaryMaxTokens={:?}, claudeCliPath={:?}",
         &provider,
         &model,
         &whisper_model,
         &ollama_endpoint,
-        &summary_max_tokens
+        &summary_max_tokens,
+        &claude_cli_path
     );
     let pool = state.db_manager.pool();
 
@@ -611,6 +701,17 @@ pub async fn api_save_model_config<R: Runtime>(
     {
         log_error!("❌ Failed to save model config to database: {}", e);
         return Err(e.to_string());
+    }
+
+    // The Claude Code CLI path is only meaningful for that provider, but it is
+    // saved whenever it is sent so the override survives switching away and back.
+    if provider == "claude-cli" {
+        if let Err(e) =
+            SettingsRepository::save_claude_cli_path(pool, claude_cli_path.as_deref()).await
+        {
+            log_error!("❌ Failed to save Claude Code CLI path: {}", e);
+            return Err(e.to_string());
+        }
     }
 
     // Skip API key saving for custom-openai provider (it uses customOpenAIConfig JSON instead)

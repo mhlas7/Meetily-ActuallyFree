@@ -9,7 +9,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { TranscriptModelProps } from '@/components/TranscriptSettings';
 
 export interface ModelConfig {
-  provider: 'ollama' | 'groq' | 'claude' | 'openrouter' | 'openai' | 'builtin-ai' | 'custom-openai';
+  provider: 'ollama' | 'groq' | 'claude' | 'claude-cli' | 'openrouter' | 'openai' | 'builtin-ai' | 'custom-openai';
   model: string;
   whisperModel: string;
   /**
@@ -20,6 +20,8 @@ export interface ModelConfig {
   ollamaEndpoint?: string | null;
   /** Cap on summary output length; null uses the provider default */
   summaryMaxTokens?: number | null;
+  /** Explicit `claude` executable path; null means auto-discover (provider 'claude-cli' only) */
+  claudeCliPath?: string | null;
   // Custom OpenAI fields (only populated when provider is 'custom-openai')
   customOpenAIEndpoint?: string | null;
   customOpenAIModel?: string | null;
@@ -41,6 +43,9 @@ export interface CustomOpenAIConfig {
 export interface RecordingPreferences {
   preferred_mic_device: string | null;
   preferred_system_device: string | null;
+  per_app_recording_enabled?: boolean;
+  per_app_target_app?: string | null;
+  per_app_target_name?: string | null;
 }
 
 /**

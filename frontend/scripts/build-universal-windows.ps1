@@ -187,6 +187,15 @@ function Build-Variant([string]$Name, [string]$TargetDir, [string[]]$Features) {
   } finally { Pop-Location }
   $binary = Join-Path $TargetDir "release\meetily.exe"
   if (-not (Test-Path $binary)) { throw "$Name binary missing: $binary" }
+  # Tauri's packaging pass can relink the CPU placeholder with a different
+  # context. Retain each EXE/PDB pair before that pass overwrites its symbols.
+  $pdb = Join-Path $TargetDir "release\meetily.pdb"
+  if (Test-Path $pdb) {
+    $symbols = Join-Path $repo "target\release-symbols\$appVersion\$($Name.ToLowerInvariant())"
+    New-Item -ItemType Directory -Force -Path $symbols | Out-Null
+    Copy-Item $binary (Join-Path $symbols "meetily.exe") -Force
+    Copy-Item $pdb (Join-Path $symbols "meetily.pdb") -Force
+  }
   return $binary
 }
 
@@ -290,9 +299,18 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path $output)) {
 if ($LASTEXITCODE -ne 0) { throw "Frameless installer signing failed" }
 
 $signature = (Get-Content $updaterSignatureOutput -Raw).Trim()
+# Keep in-app updater notes aligned with this version's published release notes.
+# A future version without a notes file must not inherit an older release's claims.
+$notesPath = Join-Path $repo ("docs\RELEASE_V{0}.md" -f $appVersion.Replace('.', ''))
+$releaseNotes = if (Test-Path $notesPath) {
+    # Get-Content attaches PowerShell provider metadata to the string. Windows
+    # PowerShell can serialize that as an object (including filesystem details),
+    # but the updater requires notes to be plain text.
+    [System.IO.File]::ReadAllText($notesPath)
+} else { "Meetily $appVersion. See https://github.com/TylerBuza/Meetily-ActuallyFree/releases/tag/v$appVersion for release notes." }
 $latest = [ordered]@{
   version = $appVersion
-  notes = "Maintenance release: accessible meeting toolbars in narrow panels, readable disconnected-device pickers and dark-mode controls, configurable Claude summary output budgets with truncation detection, and clean source-build resources. Includes the full Windows runtime crash fix from v0.2.14."
+    notes = $releaseNotes
   pub_date = [DateTime]::UtcNow.ToString("o")
   platforms = [ordered]@{
     "windows-x86_64" = [ordered]@{

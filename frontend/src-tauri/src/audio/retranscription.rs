@@ -220,6 +220,22 @@ fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Vec<Retranscr
     sources
 }
 
+fn is_manual_speaker_label(label: &str) -> bool {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let is_generated = trimmed.split(" + ").all(|part| {
+        let p = part.trim();
+        p.eq_ignore_ascii_case("guest")
+            || p.eq_ignore_ascii_case("you")
+            || p.eq_ignore_ascii_case("unknown")
+            || (p.to_ascii_lowercase().starts_with("speaker ")
+                && p[8..].trim().chars().all(|c| c.is_ascii_digit()))
+    });
+    !is_generated
+}
+
 fn create_source_labeled_segments(
     transcripts: &[(String, f64, f64)],
     speaker_hints: &[Option<&str>],
@@ -450,6 +466,15 @@ async fn run_retranscription<R: Runtime>(
             continue;
         }
 
+        // Skip silent segments (RMS < 0.005 and peak < 0.01) to prevent Whisper silence hallucinations (e.g. "you", "thank you")
+        let sum_sq: f32 = segment.samples.iter().map(|&x| x * x).sum();
+        let rms = (sum_sq / segment.samples.len() as f32).sqrt();
+        let peak = segment.samples.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        if rms < 0.005 && peak < 0.01 {
+            debug!("Skipping silent segment {} with RMS {:.5}, peak {:.5}", i, rms, peak);
+            continue;
+        }
+
         // Transcribe this segment
         let (text, conf) = if use_parakeet {
             let engine = parakeet_engine.as_ref().unwrap();
@@ -474,6 +499,14 @@ async fn run_retranscription<R: Runtime>(
         // Skip empty transcripts
         let trimmed = text.trim();
         if !trimmed.is_empty() {
+            // Filter out known Whisper silence hallucinations if energy is low
+            let lower = trimmed.to_lowercase();
+            let is_hallucination = (lower == "you" || lower == "you." || lower == "thank you." || lower == "thank you" || lower == "thanks." || lower == "bye." || lower == "bye") && rms < 0.02;
+            if is_hallucination {
+                warn!("Dropping suspected silence hallucination on segment {}: '{}' (rms={:.5}, conf={:.2})", i + 1, trimmed, rms, conf);
+                continue;
+            }
+
             debug!(
                 "Segment {}/{}: {:.1}s, conf={:.2}, text='{}'",
                 i + 1, processable_count, segment_duration_sec, conf,
@@ -522,9 +555,71 @@ async fn run_retranscription<R: Runtime>(
     let recording_started_at = crate::api::recording_started_at_from_folder(&meeting_folder_path)
         .unwrap_or(stored_recording_start.0);
 
+    // Load existing transcripts before deleting them to preserve any manually assigned speaker names
+    let existing_transcripts: Vec<(Option<f64>, Option<f64>, Option<String>)> = sqlx::query_as(
+        "SELECT audio_start_time, audio_end_time, speaker FROM transcripts WHERE meeting_id = ? ORDER BY audio_start_time ASC",
+    )
+    .bind(&meeting_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let manual_ranges: Vec<(f64, f64, String)> = existing_transcripts
+        .into_iter()
+        .filter_map(|(s_opt, e_opt, spk_opt)| {
+            let spk = spk_opt?;
+            if is_manual_speaker_label(&spk) {
+                let s = s_opt?;
+                let e = e_opt?;
+                if e > s {
+                    Some((s, e, spk))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
     // Reconstructed timestamps must remain stable across repeated runs.
-    let segments =
+    let mut segments =
         create_source_labeled_segments(&all_transcripts, &speaker_hints, recording_started_at)?;
+
+    if !manual_ranges.is_empty() {
+        for segment in &mut segments {
+            // Keep mic audio deterministically as "You"
+            let is_mic = segment
+                .speaker
+                .as_deref()
+                .map(|s| s.eq_ignore_ascii_case("you"))
+                .unwrap_or(false);
+            if is_mic {
+                continue;
+            }
+            if let (Some(seg_start), Some(seg_end)) =
+                (segment.audio_start_time, segment.audio_end_time)
+            {
+                if seg_end <= seg_start {
+                    continue;
+                }
+                let mut best_name: Option<String> = None;
+                let mut best_overlap: f64 = 0.0;
+                for (ms, me, name) in &manual_ranges {
+                    let overlap = (seg_end.min(*me) - seg_start.max(*ms)).max(0.0);
+                    if overlap > best_overlap {
+                        best_overlap = overlap;
+                        best_name = Some(name.clone());
+                    }
+                }
+                if let Some(name) = best_name {
+                    if best_overlap > 0.05 {
+                        segment.speaker = Some(name);
+                    }
+                }
+            }
+        }
+    }
 
     let mut conn = pool.acquire().await.map_err(|e| anyhow!("DB error: {}", e))?;
     let mut tx = sqlx::Connection::begin(&mut *conn)
@@ -539,13 +634,6 @@ async fn run_retranscription<R: Runtime>(
             .await
             .map_err(|e| anyhow!("Failed to repair meeting recording start: {}", e))?;
     }
-
-    crate::database::repositories::person::clear_meeting_speaker_mappings(
-        &mut tx,
-        &meeting_id,
-    )
-    .await
-    .map_err(|e| anyhow!("Failed to clear person speaker mappings: {}", e))?;
 
     sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
         .bind(&meeting_id)
@@ -851,6 +939,7 @@ fn write_retranscription_metadata(
         let existing = std::fs::read_to_string(&metadata_path)?;
         let mut value: serde_json::Value = serde_json::from_str(&existing)?;
         if let Some(obj) = value.as_object_mut() {
+            obj.insert("duration_seconds".to_string(), serde_json::json!(duration_seconds));
             obj.insert("retranscribed_at".to_string(), serde_json::json!(now));
             obj.insert("status".to_string(), serde_json::json!("completed"));
             obj.insert("transcript_file".to_string(), serde_json::json!("transcripts.json"));
@@ -988,6 +1077,24 @@ pub async fn is_retranscription_in_progress_command() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retranscription_repairs_duration_and_preserves_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        std::fs::write(&path, serde_json::to_vec(&serde_json::json!({
+            "meeting_id":"original", "duration_seconds":2.5,
+            "audio_file":"voice.m4a", "summary_language":"fr",
+            "detected_summary_language":"en", "custom_field":"keep"
+        })).unwrap()).unwrap();
+        write_retranscription_metadata(dir.path(), "ignored", 5.16, "voice.m4a").unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(result["duration_seconds"], 5.16);
+        assert_eq!(result["meeting_id"], "original");
+        assert_eq!(result["summary_language"], "fr");
+        assert_eq!(result["custom_field"], "keep");
+        assert!(result.get("detected_summary_language").is_none());
+    }
 
     fn test_recording_start() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-08-30T12:00:00Z")

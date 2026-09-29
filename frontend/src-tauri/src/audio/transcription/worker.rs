@@ -60,8 +60,12 @@ pub struct TranscriptUpdate {
 }
 
 fn should_emit_transcript(transcript: &str, _confidence: Option<f32>) -> bool {
-    // Confidence is currently a text-length heuristic, not a model probability.
-    !transcript.trim().is_empty()
+    let trimmed = transcript.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Content alone cannot distinguish a valid short reply from hallucination.
+    true
 }
 
 // NOTE: get_transcript_history and get_recording_meeting_name functions
@@ -189,7 +193,10 @@ pub fn start_transcription_task<R: Runtime>(
                             // display name). System audio is remote parties →
                             // diarize into Speaker N when models are available.
                             crate::audio::common::mark_stt_activity();
-                            let chunk_source = match &chunk.device_type {
+                        let nemotron_remote = matches!(chunk.device_type, crate::audio::recording_state::DeviceType::System)
+                            && crate::diarization::live_nemotron::active();
+                        let profile_samples = nemotron_remote.then(|| chunk.data.clone());
+                        let mut chunk_source = match &chunk.device_type {
                                 crate::audio::recording_state::DeviceType::Microphone => {
                                     // Still feed the online diarizer so it learns the
                                     // user's voice embedding for later offline refine.
@@ -208,7 +215,7 @@ pub fn start_transcription_task<R: Runtime>(
                                             // System path shouldn't be the user; keep a speaker id.
                                             format!("Speaker {}", s.index + 1)
                                         }
-                                        Some(s) => format!("Speaker {}", s.index + 1),
+                                        Some(s) => s.profile_name.unwrap_or_else(|| format!("Speaker {}", s.index + 1)),
                                         None => "Guest".to_string(),
                                     }
                                 }
@@ -227,7 +234,17 @@ pub fn start_transcription_task<R: Runtime>(
                             )
                             .await
                             {
-                                Ok((transcript, confidence_opt, is_partial)) => {
+                            Ok((transcript, confidence_opt, is_partial)) => {
+                                if nemotron_remote {
+                                    // Inference runs concurrently with ASR. Wait only for bounded
+                                    // lookahead here, never on the capture or Tokio worker thread.
+                                    chunk_source = tokio::task::spawn_blocking(move || {
+                                        let label = crate::diarization::live_nemotron::label(chunk_timestamp, chunk_duration)?;
+                                        let name = profile_samples.as_deref()
+                                            .and_then(|samples| crate::diarization::voice_profiles::name_live_nemotron_turn(&label, samples));
+                                        Some(name.unwrap_or(label))
+                                    }).await.ok().flatten().unwrap_or_else(|| "Guest".into());
+                                }
                                     let confidence_str = match confidence_opt {
                                         Some(c) => format!("{:.2}", c),
                                         None => "N/A".to_string(),
@@ -499,14 +516,27 @@ async fn transcribe_chunk_with_provider(
         });
     }
 
-    // Calculate energy for logging/monitoring only
+    // Calculate energy
     let energy: f32 =
         speech_samples.iter().map(|&x| x * x).sum::<f32>() / speech_samples.len() as f32;
+    let rms = energy.sqrt();
+    let peak = speech_samples.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+
+    // Skip silent chunks to avoid Whisper silence hallucinations
+    if peak == 0.0 {
+        info!(
+            "Audio chunk {} has near-zero energy (rms: {:.6}, peak: {:.6}), skipping transcription",
+            chunk.chunk_id, rms, peak
+        );
+        return Ok((String::new(), Some(1.0), false));
+    }
+
     info!(
-        "Processing speech audio chunk {} with {} samples (energy: {:.6})",
+        "Processing speech audio chunk {} with {} samples (rms: {:.6}, peak: {:.6})",
         chunk.chunk_id,
         speech_samples.len(),
-        energy
+        rms,
+        peak
     );
 
     // Transcribe using the appropriate engine (with improved error handling)
@@ -524,6 +554,9 @@ async fn transcribe_chunk_with_provider(
                     if cleaned_text.is_empty() {
                         return Ok((String::new(), Some(confidence), is_partial));
                     }
+
+                    // Quiet replies such as "you" and "thanks" remain valid speech.
+                    // Native no-speech checks own rejection, not a phrase blacklist.
 
                     info!(
                         "Whisper transcription complete for chunk {}: '{}' (confidence: {:.2}, partial: {})",
@@ -641,6 +674,9 @@ mod tests {
     #[test]
     fn short_transcript_is_not_rejected_by_placeholder_confidence() {
         assert!(should_emit_transcript("yes", Some(0.13)));
+        assert!(should_emit_transcript("you", Some(0.13)));
+        assert!(should_emit_transcript("You.", Some(0.9)));
+        assert!(should_emit_transcript("thanks", None));
         assert!(!should_emit_transcript("   ", Some(0.9)));
     }
 }

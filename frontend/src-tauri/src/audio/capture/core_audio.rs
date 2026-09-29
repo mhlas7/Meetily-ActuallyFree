@@ -57,7 +57,12 @@ struct AudioContext {
 impl CoreAudioCapture {
     /// Create a new Core Audio capture for system audio
     pub fn new() -> Result<Self> {
-        info!("🎙️ CoreAudio: Starting Core Audio capture initialization...");
+        Self::new_with_process(None)
+    }
+
+    /// Create a new Core Audio capture targeting a specific process or global audio
+    pub fn new_with_process(target_pid: Option<u32>) -> Result<Self> {
+        info!("🎙️ CoreAudio: Starting Core Audio capture initialization (target_pid: {:?})...", target_pid);
 
         // Audio Capture permission (NSAudioCaptureUsageDescription) is required.
         // The permission dialog is automatically triggered when creating the Core Audio tap.
@@ -87,11 +92,26 @@ impl CoreAudioCapture {
         // When using a tap, the tap provides all the audio we need
         // Including both the tap AND the device creates duplicate audio (echo issue)
 
-        // Create process tap with mono global tap, excluding no processes
-        // Note: Mono tap is more reliable for system audio capture on macOS
-        info!("🎙️ CoreAudio: Creating process tap (global mono tap)...");
-        let tap_desc = ca::TapDesc::with_mono_global_tap_excluding_processes(&cidre::ns::Array::new());
+        let tap_desc = if let Some(pid) = target_pid {
+            info!("🎙️ CoreAudio: Creating process tap for target PID {}...", pid);
+            let num = cidre::ns::Number::with_i32(pid as i32);
+            let arr = cidre::ns::Array::from_slice(&[&*num]);
+            ca::TapDesc::with_mono_mixdown_of_processes(&arr)
+        } else {
+            info!("🎙️ CoreAudio: Creating process tap (global mono tap)...");
+            ca::TapDesc::with_mono_global_tap_excluding_processes(&cidre::ns::Array::new())
+        };
+
         let tap = tap_desc.create_process_tap()
+            .or_else(|err| {
+                if target_pid.is_some() {
+                    warn!("⚠️ CoreAudio: Per-process tap failed ({:?}), falling back to global tap...", err);
+                    let fallback_desc = ca::TapDesc::with_mono_global_tap_excluding_processes(&cidre::ns::Array::new());
+                    fallback_desc.create_process_tap()
+                } else {
+                    Err(err)
+                }
+            })
             .map_err(|e| {
                 error!("❌ CoreAudio: Failed to create process tap: {:?}", e);
                 anyhow::anyhow!("Failed to create process tap: {:?}", e)

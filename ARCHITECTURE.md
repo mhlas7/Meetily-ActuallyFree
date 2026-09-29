@@ -7,6 +7,12 @@ this", and the places where a reasonable-looking change silently does nothing.
 
 For build commands see [`frontend/build-cuda-env.bat`](frontend/build-cuda-env.bat).
 
+For the recording/speaker implementation's file-by-file ownership, clocks,
+worker lifecycle, model activation, and test entry points, also read
+[`docs/DEVELOPMENT_MAP.md`](docs/DEVELOPMENT_MAP.md). Repository working conventions
+are in [`AGENTS.md`](AGENTS.md); feature qualification and historical notes are
+linked from that map.
+
 ---
 
 ## 1. Shape of the app
@@ -28,6 +34,17 @@ and has been removed from this fork.
 ---
 
 ## 2. Audio pipeline
+
+Windows VAD, Parakeet, and diarization share the pinned Microsoft ONNX Runtime
+1.22 DLL initialized by `src-tauri/src/onnx_runtime.rs`. `ort/load-dynamic` is
+Windows-only; never add a second ONNX runtime dependency. `build/onnxruntime.rs`
+verifies exact archive/file hashes and stages the runtime for both packaging and
+plain cargo builds. `tauri.windows.conf.json` preserves all fork resources and
+adds `binaries/onnxruntime/*`; macOS/Linux resource lists are unchanged.
+Record must initialize both source VADs before starting any saver or exposing a
+chunk sender. Runtime failures return a distinct startup error, while recording
+destination failures remain storage errors. All three source tracks, mute
+alignment, and the 800 ms/2,000 ms live/offline policies still apply.
 
 Capture, recording, and transcription deliberately split into parallel paths in
 `src-tauri/src/audio/`:
@@ -259,6 +276,38 @@ hostnames, or device names. Do not replace it with the much broader manual
 
 ## 4. Speaker diarization ("who spoke when")
 
+The default remains the bundled Pyannote/WeSpeaker pipeline described below.
+Settings also offers optional **Nemotron-3** for live labels and post-call **Auto-detect**. An
+explicit speaker count is available only when Pyannote is selected. Nemotron
+always auto-detects, ignoring stale count requests without switching engines;
+never simulate a count by truncating its eight output channels. The live engine
+is selected at recording start. Pyannote uses the existing per-turn embedder;
+Nemotron receives continuous resampled system audio through the observer in
+`vad.rs`, before VAD removes silence. `live_nemotron.rs` owns a dedicated inference
+thread, bounded input queue, and recording-relative speaker timeline. Do not feed
+concatenated VAD speech turns into its streaming state. Microphone audio remains
+`You`. Closing streaming input drains and flushes audio; releasing the timeline
+waits until transcription processing finishes. See the development map for timing
+units, overload behavior, and the distinction between `finish()` and `stop()`.
+
+`diarization/nemotron.rs` adapts the attributed MIT-licensed Sortformer reference
+under `diarization/sortformer/` to the shared ONNX Runtime. Windows bundles the
+DirectML-enabled runtime and pinned DirectML redistributable, with an absolute-path
+dependency preload. Nemotron attempts DirectML on adapter 0, using sequential
+execution with memory patterns disabled, then recreates a CPU session if GPU
+session initialization fails. VAD and Parakeet retain CPU sessions. Its native
+feature extraction differs from Parakeet's `nemo128.onnx`; never substitute that
+preprocessor. Preserve per-speaker activity, lookahead, and speaker-aware cache
+compression. Rolling recent history alone cannot retain a long-absent speaker.
+Weights and their license download from a pinned revision with exact size and
+SHA-256 checks. Both downloaded and manually supplied models are verified before
+loading. The code license ships with the bundled diarization resources.
+
+Diarization updates speaker labels only, in one transaction. It must never
+delete split rows, shorten the original text, or infer sentence timestamps from
+character/byte proportions. Unknown local-user identity remains unknown; arrival
+order or the longest speaking duration is not evidence of "You".
+
 Implemented from scratch on the ONNX Runtime already in the build (`ort`),
 deliberately **not** by linking sherpa-onnx — that would pull in a second
 onnxruntime and risk duplicate-symbol failures at link time.
@@ -271,7 +320,8 @@ onnxruntime and risk duplicate-symbol failures at link time.
 | `models.rs` | pyannote `segmentation-3.0` (7-class powerset) + WeSpeaker ResNet34 embeddings + VBx LDA transform; includes a minimal `.npz`/`.npy` reader |
 | `clustering.rs` | Agglomerative clustering, cosine distance, average linkage |
 | `mod.rs` | Offline pipeline + Tauri commands |
-| `online.rs` | Streaming diarization for live transcription |
+| `online.rs` | Live engine selection and Pyannote/WeSpeaker per-turn clustering |
+| `live_nemotron.rs` | Continuous Nemotron worker, timeline lookup, and shutdown lifecycle |
 | `download.rs` | Repair-path model download from the project's own GitHub release |
 
 ### Offline pipeline
@@ -287,7 +337,7 @@ onnxruntime and risk duplicate-symbol failures at link time.
 5. Merge adjacent same-speaker regions.
 
 The mic track updates `<data>/voiceprint/user_voiceprint.json`; live
-diarization seeds the user centroid from that profile on later calls.
+Pyannote diarization seeds the user centroid from that profile on later calls.
 Overlapped speech remains excluded from embeddings, but overlap timing is
 retained. Transcript rows can carry combined labels such as
 `You + Speaker 1` rather than being forced to one voice.
@@ -369,7 +419,8 @@ exactly this confusion; it has been deleted along with `SettingTabs.tsx`,
 The label also has to survive the Rust side: `MeetingTranscript` must include
 `speaker`, and every place constructing it must set it.
 
-`InsightTabs` renders the complete stored Markdown as its authoritative summary.
+`components/meeting/MeetingDocument.tsx` renders the complete stored Markdown
+(`completeSummaryMarkdown` in `lib/summary-markdown.ts`) as its authoritative summary.
 English-keyword action/topic shortcuts are supplemental only; never make them the
 sole visible representation, because custom and non-English headings do not map
 reliably to those buckets. Preserve Markdown whitespace, nesting, and table syntax.
@@ -531,6 +582,23 @@ No dependency on any third party's hosting:
 | Qwen / Gemma | HuggingFace (`unsloth`, `bartowski`) |
 | Diarization | Bundled in the app (`resources/diarization/`) |
 
+### Claude Code CLI provider
+
+The `claude-cli` summary provider is the one provider that is neither an HTTP
+call nor a bundled model: it runs the user's own `claude` executable once per
+completion (`--print --output-format json`, prompt on stdin). `claude_cli/`
+owns discovery, the free `--version` / `auth status --json` probe, and the
+one-shot spawn; `llm_client::generate_summary` returns to it early, exactly as
+it does for `BuiltInAI`. The CLI is never bundled and no API key is stored —
+authentication belongs to the signed-in CLI, which is the point of the provider.
+
+Each run is stripped to a plain model call (`--tools ""`, `--strict-mcp-config`,
+`--setting-sources ""`, `--no-session-persistence`) inside an empty app-owned
+working directory. Do not relax this: with settings, hooks or MCP servers
+loaded, a summary can hit a permission prompt and hang, or absorb an unrelated
+project's `CLAUDE.md`. The prompt must stay on stdin — transcripts routinely
+exceed the Windows ~32k command-line limit.
+
 Parakeet v3 originally pointed at the upstream project's server; it was mirrored
 so this fork doesn't consume someone else's bandwidth.
 
@@ -562,6 +630,11 @@ Gotchas:
 ---
 
 ## 8. Windows installer, onboarding, and updates
+
+Packaging verification must include `binaries/onnxruntime/onnxruntime.dll`,
+`onnxruntime_providers_shared.dll`, and `onnxruntime-LICENSE.txt` and compare them
+with the verified build stage. Do not publish an executable-only update when
+introducing this runtime resource; use a newly built installer/updater package.
 
 There are deliberately **two Windows installer executables** in each release.
 They contain the same application, but they have different callers and must not
@@ -732,6 +805,10 @@ release asset so installed clients can download it. Users manually launch only
   must pass the explicit `-AllowUnsigned` build switch; Authenticode support
   remains available when `DIGICERT_KEYPAIR_ALIAS` is configured.
 - Never modify `*-universal-updater.exe` after Tauri generates its `.sig`.
+- When PDBs are generated, the universal builder preserves each EXE/PDB pair in
+  `target/release-symbols/<version>/<backend>` before packaging. Tauri may relink
+  the CPU placeholder; retain and verify the pre-packaging symbols against the
+  actual staged backend executable, not that later placeholder.
 - The outer `setup.exe` has no Tauri `.sig`; `SHA256SUMS.txt` covers it for
   manual verification.
 - Keep the updater private key and password under the ignored

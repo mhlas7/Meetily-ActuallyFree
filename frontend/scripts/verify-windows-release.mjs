@@ -15,6 +15,7 @@ const engine = `Meetily-ActuallyFree-${version}-x64-universal-updater.exe`;
 const setup = `Meetily-ActuallyFree-${version}-x64-universal-setup.exe`;
 const platform = latest.platforms['windows-x86_64'];
 assert.equal(latest.version, version);
+assert.equal(typeof latest.notes, 'string', 'Updater notes must be plain text, not PowerShell file metadata');
 assert.deepEqual(Object.keys(latest.platforms), ['windows-x86_64']);
 assert.equal(platform.url, `https://github.com/TylerBuza/Meetily-ActuallyFree/releases/download/v${version}/${engine}`);
 assert.equal(platform.signature, (await readFile(join(dist, `${engine}.sig`), 'utf8')).trim());
@@ -63,13 +64,19 @@ const sevenZip = process.env.SEVEN_ZIP || 'C:\\Program Files\\7-Zip\\7z.exe';
 run(sevenZip, ['t', join(dist, engine)]);
 const extracted = await mkdtemp(join(dist, 'verify-'));
 try {
-  run(sevenZip, ['x', join(dist, engine), `-o${extracted}`, '-y', 'installer-variants/*', 'ffmpeg.exe', 'llama-helper.exe', 'resources/*', 'runtime-deps/*']);
+  run(sevenZip, ['x', join(dist, engine), `-o${extracted}`, '-y', 'installer-variants/*', 'ffmpeg.exe', 'llama-helper.exe', 'resources/*', 'runtime-deps/*', 'binaries/onnxruntime/*']);
   for (const name of ['meetily-cpu.exe', 'meetily-vulkan.exe', 'meetily-cuda.exe', 'meetily-vulkan-probe.exe']) {
     assert.deepEqual(await hash(join(extracted, 'installer-variants', name)),
       await hash(join(repo, 'frontend/src-tauri/installer-variants', name)), `Stale packaged variant: ${name}`);
   }
   assert.deepEqual(await hash(join(extracted, 'ffmpeg.exe')),
     await hash(join(repo, 'frontend/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe')));
+  assert.deepEqual(await hash(join(extracted, 'resources/diarization/parakeet-rs-LICENSE.txt')),
+    await hash(join(repo, 'frontend/src-tauri/resources/diarization/parakeet-rs-LICENSE.txt')));
+  for (const name of ['onnxruntime.dll', 'onnxruntime_providers_shared.dll', 'onnxruntime-LICENSE.txt', 'DirectML.dll', 'DirectML-LICENSE.txt']) {
+    assert.deepEqual(await hash(join(extracted, 'binaries/onnxruntime', name)),
+      await hash(join(repo, 'frontend/src-tauri/binaries/onnxruntime', name)), `Unexpected ONNX Runtime: ${name}`);
+  }
 } finally {
   await rm(extracted, { recursive: true, force: true });
 }

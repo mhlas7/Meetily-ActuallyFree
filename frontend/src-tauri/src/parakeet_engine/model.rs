@@ -41,6 +41,8 @@ pub enum ParakeetError {
     OutputNotFound(String),
     #[error("Failed to get tensor shape for input: {0}")]
     TensorShape(String),
+    #[error("ONNX Runtime unavailable: {0}")]
+    RuntimeUnavailable(String),
 }
 
 pub struct ParakeetModel {
@@ -60,9 +62,13 @@ impl Drop for ParakeetModel {
 
 impl ParakeetModel {
     pub fn new<P: AsRef<Path>>(model_dir: P, quantized: bool) -> Result<Self, ParakeetError> {
-        let encoder = Self::init_session(&model_dir, "encoder-model", None, quantized)?;
-        let decoder_joint = Self::init_session(&model_dir, "decoder_joint-model", None, quantized)?;
-        let preprocessor = Self::init_session(&model_dir, "nemo128", None, false)?;
+        Self::new_with_backend(model_dir, quantized, super::labs::enabled())
+    }
+
+    fn new_with_backend<P: AsRef<Path>>(model_dir: P, quantized: bool, gpu: bool) -> Result<Self, ParakeetError> {
+        let encoder = Self::init_session(&model_dir, "encoder-model", None, quantized, gpu)?;
+        let decoder_joint = Self::init_session(&model_dir, "decoder_joint-model", None, quantized, false)?;
+        let preprocessor = Self::init_session(&model_dir, "nemo128", None, false, false)?;
 
         let (vocab, blank_idx) = Self::load_vocab(&model_dir)?;
         let vocab_size = vocab.len();
@@ -88,8 +94,22 @@ impl ParakeetModel {
         model_name: &str,
         intra_threads: Option<usize>,
         try_quantized: bool,
+        gpu: bool,
     ) -> Result<Session, ParakeetError> {
-        let providers = vec![CPUExecutionProvider::default().build()];
+        crate::onnx_runtime::ensure_available()
+            .map_err(|error| ParakeetError::RuntimeUnavailable(error.to_string()))?;
+        #[cfg(windows)]
+        let providers = if gpu {
+            use ort::execution_providers::DirectMLExecutionProvider;
+            vec![DirectMLExecutionProvider::default().with_device_id(0).build().error_on_failure()]
+        } else {
+            vec![CPUExecutionProvider::default().build()]
+        };
+        #[cfg(not(windows))]
+        let providers = {
+            let _ = gpu;
+            vec![CPUExecutionProvider::default().build()]
+        };
 
         // Try quantized version first if requested, fallback to regular version
         let model_filename = if try_quantized {
@@ -115,7 +135,8 @@ impl ParakeetModel {
         let mut builder = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_execution_providers(providers)?
-            .with_parallel_execution(true)?;
+            .with_parallel_execution(!gpu)?
+            .with_memory_pattern(!gpu)?;
 
         if let Some(threads) = intra_threads {
             builder = builder
@@ -123,7 +144,15 @@ impl ParakeetModel {
                 .with_inter_threads(threads)?;
         }
 
+        #[cfg(test)]
+        if gpu && model_name == "encoder-model" {
+            if let Ok(profile) = std::env::var("MEETILY_PARAKEET_PROFILE") {
+                builder = builder.with_profiling(profile)?;
+            }
+        }
+
         let session = builder.commit_from_file(model_dir.as_ref().join(&model_filename))?;
+        if gpu { log::info!("Parakeet '{}' encoder uses DirectML device 0", model_filename); }
 
         for input in &session.inputs {
             log::info!(
@@ -494,5 +523,23 @@ impl ParakeetModel {
         })?;
 
         Ok(timestamped_result)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod gpu_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "Requires MEETILY_PARAKEET_TEST_MODEL and bundled ONNX Runtime"]
+    fn directml_encoder_executes_nodes() {
+        let path = std::env::var("MEETILY_PARAKEET_TEST_MODEL").expect("Set v3 model directory");
+        let profile = std::env::temp_dir().join(format!("meetily-parakeet-dml-{}.json", std::process::id()));
+        std::env::set_var("MEETILY_PARAKEET_PROFILE", &profile);
+        let mut model = ParakeetModel::new_with_backend(path, true, true).expect("load DirectML model");
+        model.transcribe_samples(vec![0.0; 32_000]).expect("transcribe synthetic silence");
+        let written = model.encoder.end_profiling().expect("finish profiling");
+        let events = std::fs::read_to_string(written).expect("read profiling events");
+        assert!(events.contains("DmlExecutionProvider"), "No encoder nodes executed on DirectML");
     }
 }

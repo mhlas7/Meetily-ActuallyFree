@@ -1,11 +1,30 @@
 import React, { useState, useEffect } from 'react';
 import { Switch } from '@/components/ui/switch';
-import { FolderCog, FolderOpen } from 'lucide-react';
+import { AlertTriangle, FolderCog, FolderOpen } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { invoke } from '@tauri-apps/api/core';
-import { DeviceSelection, SelectedDevices } from '@/components/DeviceSelection';
 import Analytics from '@/lib/analytics';
 import { toast } from 'sonner';
 import { useConfig } from '@/contexts/ConfigContext';
+
+/** A running app that can be recorded on its own (Windows and macOS). */
+export interface RecordableApp {
+  id: string;
+  name: string;
+  executable: string;
+  pid: number | null;
+  /** Playing sound right now (Windows). */
+  has_audio: boolean;
+  icon: string | null;
+}
+
+export interface PerAppTarget {
+  id: string;
+  name: string;
+  executable: string;
+  icon?: string | null;
+}
 
 export interface RecordingPreferences {
   save_folder: string;
@@ -17,6 +36,14 @@ export interface RecordingPreferences {
   mic_gain?: number;
   /** System-audio gain before metering, transcription, and recording (0.5–3.0). */
   system_gain?: number;
+  /** Faster real-time streaming mode: cuts audio segments frequently (~3.5s) with fast pause detection (350ms). */
+  real_time_transcription?: boolean;
+  /** Record only `per_app_targets` instead of all computer audio. */
+  per_app_recording_enabled?: boolean;
+  /** Older single-app format; kept equal to the first target. */
+  per_app_target_app?: string | null;
+  per_app_target_name?: string | null;
+  per_app_targets?: PerAppTarget[];
 }
 
 interface RecordingSettingsProps {
@@ -24,7 +51,7 @@ interface RecordingSettingsProps {
 }
 
 export function RecordingSettings({ onSave }: RecordingSettingsProps) {
-  const { updateRecordingsLocation } = useConfig();
+  const { updateRecordingsLocation, setSelectedDevices } = useConfig();
   const [preferences, setPreferences] = useState<RecordingPreferences>({
     save_folder: '',
     auto_save: true,
@@ -33,6 +60,7 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     preferred_system_device: null,
     mic_gain: 1.0,
     system_gain: 1.0,
+    real_time_transcription: false,
   });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -45,6 +73,10 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
       try {
         const prefs = await invoke<RecordingPreferences>('get_recording_preferences');
         setPreferences(prefs);
+        setSelectedDevices({
+          micDevice: prefs.preferred_mic_device ?? null,
+          systemDevice: prefs.preferred_system_device ?? null,
+        });
       } catch (error) {
         console.error('Failed to load recording preferences:', error);
         // If loading fails, get default folder path
@@ -78,44 +110,12 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
   }, []);
 
   const handleAutoSaveToggle = async (enabled: boolean) => {
-    const newPreferences = { ...preferences, auto_save: enabled };
-    setPreferences(newPreferences);
-    await savePreferences(newPreferences);
+    setPreferences((current) => ({ ...current, auto_save: enabled }));
+    await savePreferences({ auto_save: enabled });
 
     // Track auto-save setting change
     await Analytics.track('auto_save_recording_toggled', {
       enabled: enabled.toString()
-    });
-  };
-
-  const handleMicGainChange = async (value: number) => {
-    const mic_gain = Math.min(3, Math.max(0.5, value));
-    const newPreferences = { ...preferences, mic_gain };
-    setPreferences(newPreferences);
-    await savePreferences(newPreferences);
-  };
-
-  const handleSystemGainChange = async (value: number) => {
-    const system_gain = Math.min(3, Math.max(0.5, value));
-    const newPreferences = { ...preferences, system_gain };
-    setPreferences(newPreferences);
-    await savePreferences(newPreferences);
-  };
-
-  const handleDeviceChange = async (devices: SelectedDevices) => {
-    const newPreferences = {
-      ...preferences,
-      preferred_mic_device: devices.micDevice,
-      preferred_system_device: devices.systemDevice
-    };
-    setPreferences(newPreferences);
-    await savePreferences(newPreferences);
-
-    // Track default device preference changes
-    // Note: Individual device selection analytics are tracked in DeviceSelection component
-    await Analytics.track('default_devices_changed', {
-      has_preferred_microphone: (!!devices.micDevice).toString(),
-      has_preferred_system_audio: (!!devices.systemDevice).toString()
     });
   };
 
@@ -138,7 +138,8 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
       const selectedFolder = await invoke<string | null>('select_recording_folder');
       if (!selectedFolder) return;
 
-      const newPreferences = { ...preferences, save_folder: selectedFolder };
+      const current = await invoke<RecordingPreferences>('get_recording_preferences');
+      const newPreferences = { ...current, save_folder: selectedFolder };
       await invoke('set_recording_preferences', { preferences: newPreferences });
       setPreferences(newPreferences);
       updateRecordingsLocation(selectedFolder);
@@ -172,21 +173,21 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     }
   };
 
-  const savePreferences = async (prefs: RecordingPreferences) => {
+  // Saved over the latest stored preferences, so choices made in the record
+  // card (devices, sensitivity, which apps to record) are never overwritten.
+  const savePreferences = async (patch: Partial<RecordingPreferences>) => {
     setSaving(true);
     try {
+      const current = await invoke<RecordingPreferences>('get_recording_preferences');
+      const prefs = { ...current, ...patch };
       await invoke('set_recording_preferences', { preferences: prefs });
+      setPreferences(prefs);
       onSave?.(prefs);
 
-      // Show success toast with device details
-      const micDevice = prefs.preferred_mic_device || 'Default';
-      const systemDevice = prefs.preferred_system_device || 'Default';
-      toast.success("Device preferences saved", {
-        description: `Microphone: ${micDevice}, System Audio: ${systemDevice}`
-      });
+      toast.success('Recording settings saved');
     } catch (error) {
       console.error('Failed to save recording preferences:', error);
-      toast.error("Failed to save device preferences", {
+      toast.error('Could not save recording settings', {
         description: error instanceof Error ? error.message : String(error)
       });
     } finally {
@@ -196,195 +197,54 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
 
   if (loading) {
     return (
-      <div className="animate-pulse">
-        <div className="h-4 bg-gray-200 rounded w-1/4 mb-4"></div>
-        <div className="h-8 bg-gray-200 rounded mb-4"></div>
+      <div className="space-y-3">
+        <div className="af-skeleton h-20 rounded-2xl" />
+        <div className="af-skeleton h-28 rounded-2xl" />
       </div>
     );
   }
 
   return (
-    <div className="min-w-0 max-w-full space-y-6">
-      <div className="min-w-0">
-        <h3 className="mb-4 text-lg font-semibold">Recording Settings</h3>
-        <p className="mb-6 text-sm text-gray-600">
-          Configure how your audio recordings are saved during meetings.
-        </p>
-      </div>
-
-      {/* Auto Save Toggle */}
-      <div className="flex min-w-0 items-start justify-between gap-3 rounded-lg border p-4 sm:items-center">
+    <div className="min-w-0 max-w-full space-y-5">
+      <div className="flex min-w-0 items-center justify-between gap-4 rounded-2xl border border-af-border bg-af-panel-2/40 p-5">
         <div className="min-w-0 flex-1">
-          <div className="font-medium">Save Audio Recordings</div>
-          <div className="text-sm text-gray-600">
-            Automatically save audio files when recording stops
-          </div>
-        </div>
-        <Switch
-          checked={preferences.auto_save}
-          onCheckedChange={handleAutoSaveToggle}
-          disabled={saving}
-          className="shrink-0"
-        />
-      </div>
-
-      {/* Mic gain — boost local voice after loudness normalize */}
-      <div className="min-w-0 space-y-3 rounded-lg border p-4">
-        <div className="flex min-w-0 items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <div className="font-medium">Microphone gain</div>
-            <div className="text-sm text-gray-600 break-words">
-              Boost your voice if it sounds quiet next to system audio (0.5×–3×)
-            </div>
-          </div>
-          <span className="shrink-0 text-sm font-semibold tabular-nums text-[var(--af-text)]">
-            {(preferences.mic_gain ?? 1).toFixed(1)}×
-          </span>
-        </div>
-        <input
-          type="range"
-          min={0.5}
-          max={3}
-          step={0.1}
-          value={preferences.mic_gain ?? 1}
-          disabled={saving}
-          onChange={(e) => {
-            const v = parseFloat(e.target.value);
-            setPreferences((p) => ({ ...p, mic_gain: v }));
-          }}
-          onMouseUp={(e) => void handleMicGainChange(parseFloat((e.target as HTMLInputElement).value))}
-          onTouchEnd={(e) => void handleMicGainChange(parseFloat((e.target as HTMLInputElement).value))}
-          onBlur={(e) => void handleMicGainChange(parseFloat(e.target.value))}
-          className="w-full min-w-0 max-w-full accent-[var(--af-accent,#4a8bff)]"
-        />
-        <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-gray-500">
-          <span>Quieter</span>
-          <button
-            type="button"
-            className="underline hover:text-gray-800"
-            disabled={saving}
-            onClick={() => void handleMicGainChange(1)}
-          >
-            Reset 1.0×
-          </button>
-          <span>Louder</span>
-        </div>
-      </div>
-
-      {/* System gain — applied before meters, transcription, and saved tracks */}
-      <div className="min-w-0 space-y-3 rounded-lg border p-4">
-        <div className="flex min-w-0 items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <div className="font-medium">System audio gain</div>
-            <div className="text-sm text-gray-600 break-words">
-              Balance other participants and computer audio (0.5×–3×)
-            </div>
-          </div>
-          <span className="shrink-0 text-sm font-semibold tabular-nums text-[var(--af-text)]">
-            {(preferences.system_gain ?? 1).toFixed(1)}×
-          </span>
-        </div>
-        <input
-          type="range"
-          min={0.5}
-          max={3}
-          step={0.1}
-          value={preferences.system_gain ?? 1}
-          disabled={saving}
-          onChange={(e) => {
-            const v = parseFloat(e.target.value);
-            setPreferences((p) => ({ ...p, system_gain: v }));
-          }}
-          onMouseUp={(e) => void handleSystemGainChange(parseFloat((e.target as HTMLInputElement).value))}
-          onTouchEnd={(e) => void handleSystemGainChange(parseFloat((e.target as HTMLInputElement).value))}
-          onBlur={(e) => void handleSystemGainChange(parseFloat(e.target.value))}
-          className="w-full min-w-0 max-w-full accent-[var(--af-accent,#4a8bff)]"
-        />
-        <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-gray-500">
-          <span>Quieter</span>
-          <button
-            type="button"
-            className="underline hover:text-gray-800"
-            disabled={saving}
-            onClick={() => void handleSystemGainChange(1)}
-          >
-            Reset 1.0×
-          </button>
-          <span>Louder</span>
-        </div>
-        <p className="text-xs text-amber-700">
-          If boosted audio repeatedly hits the safety limiter, the live system meter warns you to lower this gain or playback volume.
-        </p>
-      </div>
-
-      {/* Folder Location - Only shown when auto_save is enabled */}
-      {preferences.auto_save && (
-        <div className="min-w-0 space-y-4">
-          <div className="min-w-0 rounded-lg border bg-gray-50 p-4">
-            <div className="mb-2 font-medium">Save Location</div>
-            <div className="mb-3 break-all text-sm text-gray-600">
-              {preferences.save_folder || 'Default folder'}
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <button
-                onClick={handleChangeFolder}
-                disabled={isChoosingFolder || saving}
-                className="flex items-center gap-2 px-3 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-50 transition-colors disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                <FolderCog className="w-4 h-4" />
-                {isChoosingFolder ? 'Choosing...' : 'Change Folder'}
-              </button>
-              <button
-                onClick={handleOpenFolder}
-                disabled={isChoosingFolder}
-                className="flex items-center gap-2 px-3 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-50 transition-colors disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                <FolderOpen className="w-4 h-4" />
-                Open Folder
-              </button>
-            </div>
-          </div>
-
-          <div className="p-4 border rounded-lg bg-blue-50">
-            <div className="text-sm text-blue-800">
-              <strong>File Format:</strong> {preferences.file_format.toUpperCase()} files
-            </div>
-            <div className="text-xs text-blue-600 mt-1">
-              Recordings are saved with timestamp: recording_YYYYMMDD_HHMMSS.{preferences.file_format}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Info when auto_save is disabled */}
-      {!preferences.auto_save && (
-        <div className="p-4 border rounded-lg bg-yellow-50">
-          <div className="text-sm text-yellow-800">
-            Audio recording is disabled. Enable "Save Audio Recordings" to automatically save your meeting audio.
-          </div>
-        </div>
-      )}
-
-      {/* Device Preferences */}
-      <div className="space-y-4">
-        <div className="border-t pt-6">
-          <h4 className="text-base font-medium text-gray-900 mb-4">Default Audio Devices</h4>
-          <p className="text-sm text-gray-600 mb-4">
-            Set your preferred microphone and system audio devices for recording. These will be automatically selected when starting new recordings.
+          <h3 className="text-[15px] font-semibold text-af-text">Save audio</h3>
+          <p className="mt-0.5 text-[13px] leading-relaxed text-af-text-3">
+            Keep each meeting's audio so you can play it back, fix who said what, and transcribe it again later.
           </p>
-
-          <div className="border rounded-lg p-4 bg-gray-50">
-            <DeviceSelection
-              selectedDevices={{
-                micDevice: preferences.preferred_mic_device,
-                systemDevice: preferences.preferred_system_device
-              }}
-              onDeviceChange={handleDeviceChange}
-              disabled={saving}
-            />
-          </div>
         </div>
+        <Switch checked={preferences.auto_save} onCheckedChange={handleAutoSaveToggle} disabled={saving} className="shrink-0" />
       </div>
+
+      {preferences.auto_save ? (
+        <div className="min-w-0 rounded-2xl border border-af-border bg-af-panel-2/40 p-5">
+          <h3 className="text-[15px] font-semibold text-af-text">Where recordings are saved</h3>
+          <p className="mt-2 break-all rounded-lg border border-af-border bg-af-panel px-3 py-2 font-mono text-xs text-af-text-2">
+            {preferences.save_folder || 'Default folder'}
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button variant="secondary" size="sm" onClick={handleChangeFolder} disabled={isChoosingFolder || saving} loading={isChoosingFolder}>
+              <FolderCog />
+              Change folder
+            </Button>
+            <Button variant="ghost" size="sm" onClick={handleOpenFolder} disabled={isChoosingFolder}>
+              <FolderOpen />
+              Open folder
+            </Button>
+          </div>
+          <p className="mt-3 text-xs text-af-text-4">
+            Saved as {preferences.file_format.toUpperCase()} files named recording_YYYYMMDD_HHMMSS.{preferences.file_format}.
+          </p>
+        </div>
+      ) : (
+        <Alert variant="warning">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertTitle>Audio isn't being saved</AlertTitle>
+          <AlertDescription className="text-af-text-2">
+            Transcripts are kept, but you won't be able to play meetings back or transcribe them again. Turn on Save audio to keep it.
+          </AlertDescription>
+        </Alert>
+      )}
     </div>
   );
 }

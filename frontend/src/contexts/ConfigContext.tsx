@@ -5,8 +5,8 @@ import { TranscriptModelProps } from '@/components/TranscriptSettings';
 import { SelectedDevices } from '@/components/DeviceSelection';
 import { configService, ModelConfig } from '@/services/configService';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import Analytics from '@/lib/analytics';
-import { BetaFeatures, BetaFeatureKey, loadBetaFeatures, saveBetaFeatures } from '@/types/betaFeatures';
 
 export interface OllamaModel {
   name: string;
@@ -64,8 +64,6 @@ interface ConfigContextType {
   toggleConfidenceIndicator: (checked: boolean) => void;
 
   // Beta features
-  betaFeatures: BetaFeatures;
-  toggleBetaFeature: (featureKey: BetaFeatureKey, enabled: boolean) => void;
 
   // Ollama models
   models: OllamaModel[];
@@ -171,11 +169,6 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     return true;
   });
 
-  // Beta features state (localStorage)
-  const [betaFeatures, setBetaFeatures] = useState<BetaFeatures>(() => {
-    return loadBetaFeatures();
-  });
-
   // Preference settings state (lazy loaded)
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings | null>(null);
   const [storageLocations, setStorageLocations] = useState<StorageLocations | null>(null);
@@ -201,10 +194,13 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
 
   // Load transcript configuration on mount
   useEffect(() => {
+    let disposed = false;
+    let revision = 0;
     const loadTranscriptConfig = async () => {
+      const request = ++revision;
       try {
         const config = await configService.getTranscriptConfig();
-        if (config) {
+        if (config && !disposed && request === revision) {
           console.log('[ConfigContext] Loaded saved transcript config:', config);
           setTranscriptModelConfig({
             provider: config.provider || 'parakeet',
@@ -217,6 +213,8 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
       }
     };
     loadTranscriptConfig();
+    const stop = listen('transcript-config-changed', loadTranscriptConfig);
+    return () => { disposed = true; void stop.then(unlisten => unlisten()).catch(console.error); };
   }, []);
 
   // Sync language preference to Rust on mount (fixes startup desync bug)
@@ -374,6 +372,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
   const modelOptions: Record<ModelConfig['provider'], string[]> = {
     ollama: models.map(model => model.name),
     claude: ['claude-3-5-sonnet-latest'],
+    'claude-cli': ['sonnet', 'opus', 'haiku', 'default'],
     groq: ['llama-3.3-70b-versatile'],
     openrouter: [],
     openai: ['gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo'],
@@ -397,22 +396,6 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
       localStorage.setItem('isAutoSummary', checked.toString());
     }
   }, [])
-
-  // Toggle beta feature with localStorage persistence and analytics
-  const toggleBetaFeature = useCallback((featureKey: BetaFeatureKey, enabled: boolean) => {
-    setBetaFeatures(prev => {
-      const updated = { ...prev, [featureKey]: enabled };
-      saveBetaFeatures(updated);
-
-      // Track analytics with specific feature
-      Analytics.track('beta_feature_toggled', {
-        feature: featureKey,
-        enabled: enabled.toString(),
-      }).catch(err => console.error('Failed to track beta feature toggle:', err));
-
-      return updated;
-    });
-  }, []);
 
   // Update individual provider API key
   const updateProviderApiKey = useCallback((provider: string, apiKey: string | null) => {
@@ -516,8 +499,6 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     setSelectedLanguage: handleSetSelectedLanguage,
     showConfidenceIndicator,
     toggleConfidenceIndicator,
-    betaFeatures,
-    toggleBetaFeature,
     models,
     modelOptions,
     error,
@@ -539,8 +520,6 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     handleSetSelectedLanguage,
     showConfidenceIndicator,
     toggleConfidenceIndicator,
-    betaFeatures,
-    toggleBetaFeature,
     models,
     modelOptions,
     error,
