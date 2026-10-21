@@ -5,6 +5,7 @@ import {
   preferenceForSelection,
   resolveSelectedDeviceName,
   toDeviceOptionValue,
+  UNAVAILABLE_DEVICE_VALUE,
 } from '../../src/lib/audio-devices';
 
 describe('toDeviceOptionValue', () => {
@@ -26,9 +27,10 @@ describe('deviceSelectValue', () => {
     expect(deviceSelectValue('JBL Tune 770NC (input)', available)).toBe('JBL Tune 770NC (input)');
   });
 
-  test('falls back to the default sentinel when the saved device is gone', () => {
+  test('uses a distinct saved-device item so selecting Default can clear the preference', () => {
     // The disconnected-Bluetooth case: previously left the picker blank.
-    expect(deviceSelectValue('Disconnected Headset (input)', available)).toBe('default');
+    expect(deviceSelectValue('Disconnected Headset (input)', available)).toBe(UNAVAILABLE_DEVICE_VALUE);
+    expect(UNAVAILABLE_DEVICE_VALUE).not.toBe('default');
   });
 
   test('returns the default sentinel when nothing is saved', () => {
@@ -36,11 +38,18 @@ describe('deviceSelectValue', () => {
   });
 
   test('falls back while the device list is still empty', () => {
-    expect(deviceSelectValue('JBL Tune 770NC (input)', [])).toBe('default');
+    expect(deviceSelectValue('JBL Tune 770NC (input)', [])).toBe(UNAVAILABLE_DEVICE_VALUE);
   });
 
   test('does not match on a partial name', () => {
-    expect(deviceSelectValue('JBL Tune 770NC', available)).toBe('default');
+    expect(deviceSelectValue('JBL Tune 770NC', available)).toBe(UNAVAILABLE_DEVICE_VALUE);
+  });
+
+  test('restores a reconnected device without changing the saved preference', () => {
+    const saved = 'JBL Tune 770NC (input)';
+    expect(deviceSelectValue(saved, [])).toBe(UNAVAILABLE_DEVICE_VALUE);
+    expect(deviceSelectValue(saved, available)).toBe(saved);
+    expect(deviceSelectValue(null, available)).toBe('default');
   });
 });
 
