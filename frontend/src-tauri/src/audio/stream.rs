@@ -30,7 +30,7 @@ use super::capture::CoreAudioCapture;
 use super::recording_state::AudioError;
 
 #[cfg(target_os = "linux")]
-use super::capture::{resolve_monitor_source, resolve_source, PulseCapture};
+use super::capture::{find_monitor_source_by_description, find_source_by_description, PulseCapture};
 #[cfg(target_os = "linux")]
 use super::capture_worker::NativeCleanup;
 #[cfg(target_os = "linux")]
@@ -607,7 +607,7 @@ impl AudioStream {
             .unwrap_or(&device.name);
         description = description.strip_suffix(" (output)").unwrap_or(description);
 
-        let monitor_source_name = resolve_monitor_source(description)
+        let monitor_source_name = find_monitor_source_by_description(description)
             .map_err(|e| anyhow::anyhow!("Failed to resolve PulseAudio sink '{}': {}", description, e))?;
 
         let capture_impl = PulseCapture::new_system(&monitor_source_name)
@@ -662,7 +662,7 @@ impl AudioStream {
         anyhow::ensure!(!NATIVE_CLEANUPS.is_pending(),
             "Previous PulseAudio capture cleanup is still running; retry recording shortly");
 
-        let source_name = resolve_source(&device.name)
+        let source_name = find_source_by_description(&device.name)
             .map_err(|e| anyhow::anyhow!("Failed to resolve PulseAudio source '{}': {}", device.name, e))?;
 
         let capture_impl = PulseCapture::new_microphone(&source_name)
