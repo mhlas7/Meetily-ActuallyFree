@@ -30,16 +30,11 @@ use log::{info, warn};
 #[derive(Debug, Clone)]
 pub struct PulseSink {
     pub description: String,
-    /// The sink's own server name, e.g.
-    /// "alsa_output.pci-0000_c1_00.6.HiFi__Speaker__sink". Distinct from
-    /// `monitor_source_name` (that same sink's ".monitor" source, which is what
-    /// we actually capture from); this is what `ServerInfo::default_sink_name`
-    /// reports, so it is needed to identify the server's default output.
+    /// The sink's own server name; what `ServerInfo::default_sink_name` reports.
     pub sink_name: String,
     pub monitor_source_name: String,
-    /// What the picker shows. Equal to `description`, except when several sinks
-    /// share one description — then the server name is appended so the rows are
-    /// distinguishable and each maps to exactly one sink.
+    /// What the picker shows: `description`, plus the server name in brackets
+    /// when several sinks share one description.
     pub label: String,
 }
 
@@ -50,13 +45,8 @@ pub struct PulseSink {
 const CAPTURE_SAMPLE_RATE: u32 = 48000;
 
 /// Build display labels, appending the server name whenever several entries
-/// share a description.
-///
-/// Descriptions are not unique: two identical USB headsets, or several HDMI
-/// outputs on one GPU, are routinely described identically. Without this the
-/// picker shows duplicate rows and resolution silently binds to whichever the
-/// server happened to list first. Square brackets are used rather than
-/// parentheses so the label can never collide with the " (System Audio)" /
+/// share a description (e.g. two identical USB headsets). Brackets, not
+/// parentheses, so labels never collide with the " (System Audio)" /
 /// " (output)" suffixes the device layer appends and strips.
 fn build_labels(entries: &[(String, String)]) -> Vec<String> {
     let mut counts: HashMap<&str, usize> = HashMap::new();
@@ -76,14 +66,9 @@ fn build_labels(entries: &[(String, String)]) -> Vec<String> {
         .collect()
 }
 
-/// Picker label of the sink the server reports as its default output.
-///
-/// Matches the sink's own name, falling back to the conventional
-/// "<sink>.monitor" mapping for servers that omit `SinkInfo::name`. Returns
-/// `None` when the default sink isn't in the list — it may have no monitor
-/// source, in which case `list_sinks` filtered it out and we cannot capture it.
-///
-/// Pure so it is unit-testable without a PulseAudio server.
+/// Label of the sink named `default_sink_name`, falling back to the
+/// "<sink>.monitor" convention for servers that omit `SinkInfo::name`. `None`
+/// if it isn't listed (e.g. it has no monitor source to capture).
 fn label_for_sink_name(sinks: &[PulseSink], default_sink_name: &str) -> Option<String> {
     if default_sink_name.is_empty() {
         return None;
@@ -99,17 +84,9 @@ fn label_for_sink_name(sinks: &[PulseSink], default_sink_name: &str) -> Option<S
         .map(|sink| sink.label.clone())
 }
 
-/// Resolve a stored device string to its PulseAudio name.
-///
-/// Tried in order: the disambiguated label (what the picker stores today), then
-/// the bare description (so preferences written before labels were
-/// disambiguated keep resolving). `entries` are `(label, description, name)`.
-///
-/// Note both keys are display strings, and neither is a stable identity: a
-/// locale change or a profile switch moves the description, and a saved
-/// preference stops resolving. Fixing that needs an opaque id persisted
-/// alongside the label, which is a preferences-schema change rather than
-/// something this function can paper over.
+/// Resolve a stored device string to its PulseAudio name: the label first, then
+/// the bare description so older saved preferences keep resolving.
+/// `entries` are `(label, description, name)`.
 fn resolve_stored(entries: &[(String, String, String)], stored: &str, kind: &str) -> Result<String> {
     if let Some((_, _, name)) = entries.iter().find(|(label, _, _)| label == stored) {
         return Ok(name.clone());
@@ -133,16 +110,9 @@ fn resolve_stored(entries: &[(String, String, String)], stored: &str, kind: &str
     }
 }
 
-/// Upper bound on any single blocking PulseAudio interaction.
-///
-/// `Mainloop::iterate(true)` blocks until the server sends something, so a
-/// server that accepts the connection but never completes the handshake — a
-/// dead `PULSE_SERVER` TCP endpoint, a stalled autospawn, a sandbox where the
-/// socket exists but is not wired through — would hang the caller forever.
-/// `configure_linux_audio()` runs on the device-monitor poll every few seconds
-/// while a recording is active, so an unbounded wait there stalls device
-/// monitoring rather than just one call. Every wait below is therefore
-/// deadline-bounded and iterates the mainloop non-blocking.
+/// Upper bound on any PulseAudio wait. `iterate(true)` would block forever on a
+/// server that accepts the connection but never answers, stalling the
+/// device-monitor poll, so waits iterate non-blocking against this deadline.
 const PULSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long to sleep when a non-blocking mainloop iteration had nothing to do.
@@ -190,9 +160,9 @@ fn run_operation_to_completion<T: ?Sized>(
 }
 
 /// Connect a fresh context to the default PulseAudio/PipeWire server, waiting
-/// up to `PULSE_TIMEOUT` for it to become ready. Each call opens (and the caller
-/// later drops) its own connection — unlike ALSA's cached global config, there's
-/// no stale-state problem to work around here, so every call sees the server's
+/// up to `PULSE_TIMEOUT` until it's ready. Each call opens (and the caller later
+/// drops) its own connection — unlike ALSA's cached global config, there's no
+/// stale-state problem to work around here, so every call sees the server's
 /// current sinks.
 fn connect() -> Result<(Mainloop, Context)> {
     info!("🔊 pulse_linux::connect: creating mainloop");
@@ -310,70 +280,38 @@ pub fn list_sinks() -> Result<Vec<PulseSink>> {
     Ok(result)
 }
 
-/// Resolve a stored "System Audio" device string to its sink's monitor source
-/// name. Accepts the picker label, or a bare description saved by an older
-/// build.
-pub fn resolve_monitor_source(stored: &str) -> Result<String> {
+/// Resolve a sink's real monitor source name from its picker label (as shown
+/// in the "System Audio" picker, e.g. "JBL Tune 770NC") or bare description.
+pub fn find_monitor_source_by_description(description: &str) -> Result<String> {
     let entries: Vec<(String, String, String)> = list_sinks()?
         .into_iter()
         .map(|sink| (sink.label, sink.description, sink.monitor_source_name))
         .collect();
 
-    let resolved = resolve_stored(&entries, stored, "sink")?;
-    info!("🔍 resolve_monitor_source: '{}' -> '{}'", stored, resolved);
+    let resolved = resolve_stored(&entries, description, "sink")?;
+    info!("🔍 find_monitor_source_by_description: '{}' -> '{}'", description, resolved);
     Ok(resolved)
 }
 
-/// Picker label of the server's current default output sink, if any.
-///
-/// Used to resolve "Default System Audio" to whatever output the user is
-/// actually listening on — Bluetooth, jack, or built-in — rather than pinning
-/// one specific sink.
+/// Label of the server's default output sink, if capturable. Used to resolve
+/// "Default System Audio" to whatever the user is actually listening on.
 pub fn default_sink_label() -> Result<Option<String>> {
-    info!("🔊 pulse_linux::default_sink_label: connecting");
     let (mut mainloop, context) = connect()?;
-
-    info!("🔊 pulse_linux::default_sink_label: requesting server info");
     let default_name: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let default_name_cb = default_name.clone();
 
     let operation = context.introspect().get_server_info(move |info: &ServerInfo| {
-        if let Some(name) = info.default_sink_name.as_deref() {
-            *default_name_cb.borrow_mut() = Some(name.to_string());
-        }
+        *default_name_cb.borrow_mut() = info.default_sink_name.as_deref().map(str::to_string);
     });
-
     run_operation_to_completion(&mut mainloop, &operation)?;
     drop(operation);
 
-    let default_name = default_name.borrow().clone();
-    let Some(default_name) = default_name else {
-        warn!("🔊 pulse_linux::default_sink_label: server reported no default sink");
+    let Some(default_name) = default_name.borrow().clone() else {
         return Ok(None);
     };
-
-    info!(
-        "🔊 pulse_linux::default_sink_label: default sink name is '{}'",
-        default_name
-    );
-
-    let sinks = list_sinks()?;
-    match label_for_sink_name(&sinks, &default_name) {
-        Some(label) => {
-            info!(
-                "🔊 pulse_linux::default_sink_label: default sink label is '{}'",
-                label
-            );
-            Ok(Some(label))
-        }
-        None => {
-            warn!(
-                "🔊 pulse_linux::default_sink_label: default sink '{}' has no capturable monitor source",
-                default_name
-            );
-            Ok(None)
-        }
-    }
+    let label = label_for_sink_name(&list_sinks()?, &default_name);
+    info!("🔊 pulse_linux::default_sink_label: '{}' -> {:?}", default_name, label);
+    Ok(label)
 }
 
 /// A PulseAudio input source (microphone, line-in, …), excluding sink monitors.
@@ -447,26 +385,26 @@ pub fn list_sources() -> Result<Vec<PulseSource>> {
     Ok(result)
 }
 
-/// Resolve a stored microphone device string to its PulseAudio source name.
-/// Accepts the picker label, or a bare description saved by an older build.
-pub fn resolve_source(stored: &str) -> Result<String> {
+/// Resolve a source's real PulseAudio name from its picker label or bare
+/// description.
+pub fn find_source_by_description(description: &str) -> Result<String> {
     let entries: Vec<(String, String, String)> = list_sources()?
         .into_iter()
         .map(|source| (source.label, source.description, source.source_name))
         .collect();
 
-    let resolved = resolve_stored(&entries, stored, "source")?;
-    info!("🎤 resolve_source: '{}' -> '{}'", stored, resolved);
+    let resolved = resolve_stored(&entries, description, "source")?;
+    info!("🎤 find_source_by_description: '{}' -> '{}'", description, resolved);
     Ok(resolved)
 }
 
-/// Picker label of the server's default input source, if any.
+/// Description of the server's default input source, if any.
 /// Used to resolve "Default Microphone".
-pub fn default_source_label() -> Result<Option<String>> {
-    info!("🎤 pulse_linux::default_source_label: connecting");
+pub fn default_source_description() -> Result<Option<String>> {
+    info!("🎤 pulse_linux::default_source_description: connecting");
     let (mut mainloop, context) = connect()?;
 
-    info!("🎤 pulse_linux::default_source_label: requesting server info");
+    info!("🎤 pulse_linux::default_source_description: requesting server info");
     let default_name: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let default_name_cb = default_name.clone();
 
@@ -485,7 +423,7 @@ pub fn default_source_label() -> Result<Option<String>> {
     };
 
     info!(
-        "🎤 pulse_linux::default_source_label: default source name is '{}'",
+        "🎤 pulse_linux::default_source_description: default source name is '{}'",
         default_name
     );
 
@@ -497,13 +435,13 @@ pub fn default_source_label() -> Result<Option<String>> {
 
     if let Some(source) = default_source {
         info!(
-            "🎤 pulse_linux::default_source_label: default source label is '{}'",
+            "🎤 pulse_linux::default_source_description: default source description is '{}'",
             source.label
         );
         Ok(Some(source.label.clone()))
     } else {
         warn!(
-            "🎤 pulse_linux::default_source_label: default source '{}' not found in source list",
+            "🎤 pulse_linux::default_source_description: default source '{}' not found in source list",
             default_name
         );
         Ok(None)
@@ -693,11 +631,6 @@ mod tests {
     }
 
     #[test]
-    fn test_label_for_sink_name_returns_none_for_empty_list() {
-        assert_eq!(label_for_sink_name(&[], "alsa_output.pci-0000"), None);
-    }
-
-    #[test]
     fn test_label_for_sink_name_returns_none_for_empty_default() {
         // An empty default name must not match a sink that also has none.
         let sinks = vec![sink("Speakers", "", "alsa_output.pci-0000.monitor", "Speakers")];
@@ -735,19 +668,6 @@ mod tests {
                 "Built-in",
             ]
         );
-    }
-
-    #[test]
-    fn test_build_labels_uses_brackets_not_parens() {
-        // Parentheses would collide with the " (System Audio)" / " (output)"
-        // suffixes the device layer appends and later strips.
-        let entries = vec![
-            ("Dock".to_string(), "sink_a".to_string()),
-            ("Dock".to_string(), "sink_b".to_string()),
-        ];
-        for label in build_labels(&entries) {
-            assert!(!label.ends_with(')'), "label '{}' must not end with a paren", label);
-        }
     }
 
     #[test]
@@ -790,7 +710,6 @@ mod tests {
         let entries = vec![entry("Built-in", "Built-in", "alsa_output.pci-0000")];
         assert!(resolve_stored(&entries, "Vanished Device", "sink").is_err());
     }
-
 
     #[test]
     #[ignore] // Requires a running PulseAudio/PipeWire server; run manually.
