@@ -1467,12 +1467,13 @@ pub async fn diarize_meeting(
             }
         };
 
-        // A stored "You" came from mic capture; speaker bleed on the mic is not
-        // the local user, so it must not pin "You" onto the line.
-        let mic_is_local = !bleed.is_bleed(s, e);
+        // Speaker playback picked up by the mic is not the local user, so the
+        // bleed analysis can override a mic line's "You".
+        let mic_bleed = MicBleed::of(&bleed, s, e);
 
-        // Generated labels are not durable capture-source provenance. Preserve
-        // source hints without excluding genuine simultaneous speakers.
+        // Overlap finds every voice active during the line. With separate
+        // tracks, apply_source_track_hint then narrows that to the line's own
+        // source track, since its words were transcribed from that track alone.
         let relevant_segments: Vec<&DiarizationSegment> = result
             .segments
             .iter()
@@ -1518,7 +1519,7 @@ pub async fn diarize_meeting(
 
                 speakers.sort_unstable();
                 let mut labels: Vec<_> = speakers.into_iter().map(&speaker_label).collect();
-                apply_source_track_hint(existing.as_deref(), used_source_tracks, num_speakers != Some(1), mic_is_local, &mut labels);
+                apply_source_track_hint(existing.as_deref(), used_source_tracks, num_speakers != Some(1), mic_bleed, &mut labels);
                 labels.dedup();
                 labels.truncate(3);
                 let final_label = labels.join(" + ");
@@ -1528,7 +1529,7 @@ pub async fn diarize_meeting(
                 // No voice overlaps this line: keep the source hint, or else the
                 // label it already had, rather than clearing it.
                 let mut labels = Vec::new();
-                apply_source_track_hint(existing.as_deref(), used_source_tracks, num_speakers != Some(1), mic_is_local, &mut labels);
+                apply_source_track_hint(existing.as_deref(), used_source_tracks, num_speakers != Some(1), mic_bleed, &mut labels);
                 let fallback = (!labels.is_empty()).then(|| labels.join(" + ")).or_else(|| {
                     existing
                         .as_deref()
@@ -1763,30 +1764,105 @@ fn without_you_part(label: &str) -> Option<String> {
     (remaining.len() < parts.len() && !remaining.is_empty()).then(|| remaining.join(" + "))
 }
 
+/// A mic line's bleed share at or above this means remote playback reached
+/// the mic transcript alongside the local user.
+const MIXED_BLEED_SHARE: f32 = 0.2;
+
+/// How much of a line's mic audio is speaker playback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MicBleed {
+    /// Local speech only, or no bleed analysis (headphones, switch off).
+    Local,
+    /// Local speech with some playback mixed in.
+    Mixed,
+    /// Almost entirely playback: the words are the remote speaker's.
+    Bleed,
+}
+
+impl MicBleed {
+    fn of(analysis: &bleed::BleedAnalysis, start: f32, end: f32) -> Self {
+        if analysis.is_bleed(start, end) {
+            MicBleed::Bleed
+        } else if analysis.active && 1.0 - analysis.local_fraction(start, end) >= MIXED_BLEED_SHARE {
+            MicBleed::Mixed
+        } else {
+            MicBleed::Local
+        }
+    }
+}
+
+/// Which capture track a transcript line was transcribed from, as far as its
+/// stored label can tell. Only meaningful when separate tracks were used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineSource {
+    Mic,
+    System,
+    Unknown,
+}
+
+/// "You" is the hint written by live mic capture and by retranscription of
+/// `mic.mp4`; generated remote labels come from the system track. A generated
+/// composite saved by an earlier rerun ("You + Speaker 2") no longer says which
+/// track produced the words.
+fn line_source(existing: Option<&str>) -> LineSource {
+    let Some(label) = existing.map(str::trim).filter(|label| !label.is_empty()) else {
+        return LineSource::Unknown;
+    };
+    if label.eq_ignore_ascii_case("you") {
+        return LineSource::Mic;
+    }
+    let remote_generated = label.split(" + ").map(str::trim).all(|part| {
+        part.eq_ignore_ascii_case("guest") || part.to_ascii_lowercase().starts_with("speaker ")
+    });
+    if remote_generated {
+        LineSource::System
+    } else {
+        LineSource::Unknown
+    }
+}
+
+/// With separate mic and system tracks, each line's words were transcribed
+/// from one track, so its label follows that track. Diarization overlap with
+/// the other track only shows that someone else was audible at the time (a
+/// reply like "yeah" while the remote person talks) and does not add a
+/// speaker. Mixed recordings keep the overlap-based labels.
+///
+/// The exception is speaker bleed: when the bleed analysis finds remote
+/// playback on the mic, those words may be the remote speaker's.
 fn apply_source_track_hint(
     existing: Option<&str>,
     used_source_tracks: bool,
     allow_remote_hint: bool,
-    mic_is_local: bool,
+    mic_bleed: MicBleed,
     labels: &mut Vec<String>,
 ) {
     if !used_source_tracks {
         return;
     }
-    match existing {
-        Some(speaker) if mic_is_local && speaker.eq_ignore_ascii_case("you") => {
+    match (line_source(existing), mic_bleed) {
+        (LineSource::Mic, MicBleed::Local) => {
+            labels.clear();
+            labels.push("You".to_string());
+        }
+        (LineSource::Mic, MicBleed::Mixed) => {
             labels.retain(|label| !label.eq_ignore_ascii_case("you"));
             labels.insert(0, "You".to_string());
         }
-        Some(speaker) if allow_remote_hint && speaker.eq_ignore_ascii_case("guest") => {
-            let has_remote = labels.iter().any(|label| {
-                !label.eq_ignore_ascii_case("you") && !label.eq_ignore_ascii_case("guest")
-            });
-            if !has_remote && !labels.iter().any(|label| label.eq_ignore_ascii_case("guest")) {
+        (LineSource::Mic, MicBleed::Bleed) => {
+            labels.retain(|label| !label.eq_ignore_ascii_case("you"));
+            if labels.is_empty() && allow_remote_hint {
                 labels.push("Guest".to_string());
             }
         }
-        _ => {}
+        // An explicit solo count labels no remote voices; keep the
+        // diarization result rather than inventing a Guest.
+        (LineSource::System, _) if allow_remote_hint => {
+            labels.retain(|label| !label.eq_ignore_ascii_case("you"));
+            if labels.is_empty() {
+                labels.push("Guest".to_string());
+            }
+        }
+        (LineSource::System | LineSource::Unknown, _) => {}
     }
     if let Some(position) = labels.iter().position(|label| label.eq_ignore_ascii_case("you")) {
         let user = labels.remove(position);
@@ -1819,31 +1895,59 @@ mod tests {
     #[test]
     fn dual_track_user_hint_survives_missing_mic_segmentation() {
         let mut labels = vec!["Speaker 1".to_string()];
-        apply_source_track_hint(Some("You"), true, true, true, &mut labels);
+        apply_source_track_hint(Some("You"), true, true, MicBleed::Local, &mut labels);
 
-        assert_eq!(labels, vec!["You", "Speaker 1"]);
+        assert_eq!(labels, vec!["You"]);
     }
 
     #[test]
-    fn remote_hint_keeps_user_overlap_when_remote_segmentation_misses() {
-        let mut labels = vec!["You".to_string()];
-        apply_source_track_hint(Some("Guest"), true, true, true, &mut labels);
-
-        assert_eq!(labels, vec!["You", "Guest"]);
-    }
-
-    #[test]
-    fn dual_track_overlap_keeps_you_first_after_remote_clustering() {
+    fn mic_line_stays_you_when_remote_overlaps_more() {
+        // A short reply while the remote person talks: their system segment
+        // covers more of the line, but the words came from the mic.
         let mut labels = vec!["Speaker 1".to_string(), "You".to_string()];
-        apply_source_track_hint(Some("Guest"), true, true, true, &mut labels);
+        apply_source_track_hint(Some("You"), true, true, MicBleed::Local, &mut labels);
 
-        assert_eq!(labels, vec!["You", "Speaker 1"]);
+        assert_eq!(labels, vec!["You"]);
+    }
+
+    #[test]
+    fn remote_line_drops_overlapping_user() {
+        let mut labels = vec!["Speaker 1".to_string(), "You".to_string()];
+        apply_source_track_hint(Some("Guest"), true, true, MicBleed::Local, &mut labels);
+
+        assert_eq!(labels, vec!["Speaker 1"]);
+    }
+
+    #[test]
+    fn remote_line_falls_back_to_guest_when_only_user_overlaps() {
+        let mut labels = vec!["You".to_string()];
+        apply_source_track_hint(Some("Guest"), true, true, MicBleed::Local, &mut labels);
+
+        assert_eq!(labels, vec!["Guest"]);
+    }
+
+    #[test]
+    fn live_remote_label_counts_as_system_source() {
+        let mut labels = vec!["You".to_string(), "Speaker 2".to_string()];
+        apply_source_track_hint(Some("Speaker 2"), true, true, MicBleed::Local, &mut labels);
+
+        assert_eq!(labels, vec!["Speaker 2"]);
+    }
+
+    #[test]
+    fn earlier_composite_label_keeps_overlap_labels() {
+        let mut labels = vec!["Speaker 2".to_string(), "You".to_string()];
+        apply_source_track_hint(Some("You + Speaker 2"), true, true, MicBleed::Local, &mut labels);
+
+        assert_eq!(labels, vec!["You", "Speaker 2"]);
+        assert_eq!(line_source(None), LineSource::Unknown);
+        assert_eq!(line_source(Some("Guest + Speaker 3")), LineSource::System);
     }
 
     #[test]
     fn mixed_recording_does_not_trust_source_hint() {
         let mut labels = vec!["Speaker 1".to_string()];
-        apply_source_track_hint(Some("You"), false, true, true, &mut labels);
+        apply_source_track_hint(Some("You"), false, true, MicBleed::Local, &mut labels);
 
         assert_eq!(labels, vec!["Speaker 1"]);
     }
@@ -1851,7 +1955,7 @@ mod tests {
     #[test]
     fn explicit_solo_count_suppresses_remote_source_hint() {
         let mut labels = vec!["You".to_string()];
-        apply_source_track_hint(Some("Guest"), true, false, true, &mut labels);
+        apply_source_track_hint(Some("Guest"), true, false, MicBleed::Local, &mut labels);
 
         assert_eq!(labels, vec!["You"]);
     }
@@ -1859,17 +1963,31 @@ mod tests {
     #[test]
     fn bleed_you_line_takes_the_remote_label() {
         let mut labels = vec!["Speaker 1".to_string()];
-        apply_source_track_hint(Some("You"), true, true, false, &mut labels);
+        apply_source_track_hint(Some("You"), true, true, MicBleed::Bleed, &mut labels);
 
         assert_eq!(labels, vec!["Speaker 1"]);
     }
 
     #[test]
-    fn local_you_line_keeps_you_with_double_talk() {
+    fn mixed_bleed_you_line_keeps_you_with_remote() {
         let mut labels = vec!["Speaker 1".to_string(), "You".to_string()];
-        apply_source_track_hint(Some("You"), true, true, true, &mut labels);
+        apply_source_track_hint(Some("You"), true, true, MicBleed::Mixed, &mut labels);
 
         assert_eq!(labels, vec!["You", "Speaker 1"]);
+    }
+
+    #[test]
+    fn bleed_only_you_line_falls_back_to_guest() {
+        let mut labels = vec!["You".to_string()];
+        apply_source_track_hint(Some("You"), true, true, MicBleed::Bleed, &mut labels);
+
+        assert_eq!(labels, vec!["Guest"]);
+    }
+
+    #[test]
+    fn mic_bleed_classification_follows_the_analysis() {
+        let inactive = bleed::BleedAnalysis::inactive();
+        assert_eq!(MicBleed::of(&inactive, 1.0, 5.0), MicBleed::Local);
     }
 
     #[test]

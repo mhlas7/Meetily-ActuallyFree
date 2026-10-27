@@ -35,7 +35,10 @@ mic.mp4 + system.mp4 (written from the same aligned mixer windows, pipeline.rs)
        mic segments -> local_mic_segments: bleed-only spans dropped, mixed spans
          trimmed to local regions, BEFORE cross-track overlap marking
        voiceprint enrollment skipped when > 10 % of mic speech is bleed
-       stored "You" hint not forced onto a bleed line (apply_source_track_hint)
+       mic lines follow their source track ("You"), except per MicBleed:
+         Bleed (is_bleed) -> remote labels only, Guest if none
+         Mixed (bleed share >= 20 %) -> "You + remote"
+         Local / analysis inactive -> "You" only
        preserved named composite labels on bleed lines lose only "You"
          ("You + Alice B." -> "Alice B."); text and timings never change
   -> run_retranscription (audio/retranscription.rs):
