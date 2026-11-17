@@ -42,8 +42,9 @@ mic.mp4 + system.mp4 (written from the same aligned mixer windows, pipeline.rs)
        preserved named composite labels on bleed lines lose only "You"
          ("You + Alice B." -> "Alice B."); text and timings never change
   -> run_retranscription (audio/retranscription.rs):
-       both tracks decoded before VAD; mic VAD chunks that are bleed are dropped,
-       so the remote speaker is transcribed once (from system.mp4)
+       both tracks decoded before VAD; each mic VAD chunk is cut to its
+       local_regions (pure-bleed chunks vanish), so the remote speaker is
+       transcribed once (from system.mp4)
 ```
 
 Units: frames are 10 ms; `BleedAnalysis` takes and returns seconds;
@@ -57,9 +58,16 @@ Units: frames are 10 ms; `BleedAnalysis` takes and returns seconds;
   example, the PipeWire echo-cancel source). It never guesses a delay.
 - **Conservative toward `You`.** Short local runs (< 50 ms) are discarded as
   noise, then local runs are widened by 100 ms. A span is bleed only when it has
-  at least 10 voiced frames and under 20 % of them are local. Retranscription
-  drops a whole chunk only when it is bleed; a chunk with any substantial local
-  speech, including double-talk, is kept whole so no words are cut.
+  at least 10 voiced frames and under 20 % of them are local.
+- **Retranscription cuts mixed chunks.** Mic VAD chunks run up to ~6 s and
+  often hold a short local reply next to remote playback. Keeping such chunks
+  whole (the original design) let Whisper transcribe the playback as `You`, the
+  main remaining duplicate source. Each chunk is now cut to its
+  `local_regions`: local runs bridged across gaps of up to 300 ms, pieces under
+  200 ms dropped, and chunks without bleed frames passed through unchanged.
+  Double-talk counts as local and is kept. The cost is that Whisper sees shorter
+  pieces with less context, and a word at a local/bleed boundary may be clipped
+  despite the 100 ms widening.
 - **Diarization reruns stay label-only.** Bleed duplicates left by older
   transcriptions get the remote label rather than being deleted. Only
   retranscription, which regenerates text by design, removes them.
@@ -81,6 +89,10 @@ Units: frames are 10 ms; `BleedAnalysis` takes and returns seconds;
 - `diarization::tests`: bleed "You" lines take the remote label; local
   double-talk keeps `You`; the inactive analysis keeps mic segments unchanged;
   `without_you_part` strips only the exact "You" part.
+- `audio::retranscription::tests::mic_chunks_are_cut_to_local_speech`: a chunk
+  holding playback and then a local reply keeps only the reply, with samples and
+  millisecond timestamps still aligned; pure playback yields nothing; a
+  local-only chunk passes through unchanged.
 - `compute_fbank` was verified bit-identical to the pre-refactor implementation
   with a one-off comparison test. That test was not kept.
 - `diarization::bleed::real_meeting::bleed_real_meeting` is ignored by default
@@ -103,11 +115,23 @@ local user's speech. That run predates the Labs gate, which was added afterward.
 The gated build passed native and frontend tests but was not re-qualified in the
 app.
 
+On 2026-11-17 the same test ran on a private local 3-minute two-person call
+(Linux, C920 webcam mic, no headphones): active, delay 70 ms, confidence 0.70,
+34 % bleed. Under whole-chunk dropping, mixed chunks with local shares of
+0.21–0.36 (at 0:55, 1:12, 1:18, 1:24) were kept whole, and the remote speaker's
+sentences reappeared as `You + <remote>` lines. With cutting, those chunks
+reduce to the local pieces (for example 54.99–60.99 s → 55.08–56.23 and
+60.61–60.99 s), and 99 s of 172 s of mic chunk audio is kept. This is the
+analyzer's output only: the cut build has not been re-qualified with an in-app
+retranscription.
+
 ## Known limits
 
-- Recall is partial. Mic VAD chunks and transcript lines that span both talkers
-  keep `You` (by design), and about 80 of the 217 composite lines in the
-  qualification meeting were not flagged.
+- Recall is partial. Diarization reruns are label-only, so stored transcript
+  lines that span both talkers keep `You` (about 80 of the 217 composite lines
+  in the 2026-10-27 qualification meeting were not flagged). Retranscription
+  now cuts mixed chunks, but true double-talk still keeps the overlapped
+  playback in the mic piece.
 - In-room participants who never pass through the system track still count as
   `You`.
 - Strongly nonlinear or distorting loudspeakers, or very loud playback, may need

@@ -679,17 +679,19 @@ mod real_meeting {
             analysis.bleed_share() * 100.0
         );
 
-        // Mic speech chunks the retranscription filter would keep or drop.
+        // Mic speech chunks and the local regions retranscription would keep.
         let chunks = crate::audio::vad::get_speech_chunks_with_thresholds_and_progress(&mic, 2000, 0.20, 0.10, |_, _| true)
             .expect("mic VAD");
-        let mut dropped = 0;
+        let (mut chunk_secs, mut kept_secs) = (0.0, 0.0);
         for chunk in &chunks {
             let (s, e) = ((chunk.start_timestamp_ms / 1000.0) as f32, (chunk.end_timestamp_ms / 1000.0) as f32);
-            let bleed = analysis.is_bleed(s, e);
-            dropped += bleed as usize;
-            println!("{s:8.2}-{e:8.2}  local={:.2}  {}", analysis.local_fraction(s, e), if bleed { "DROP" } else { "keep" });
+            let regions = analysis.local_regions(s, e);
+            chunk_secs += e - s;
+            kept_secs += regions.iter().map(|(rs, re)| re - rs).sum::<f32>();
+            let shown: Vec<String> = regions.iter().map(|(rs, re)| format!("{rs:.2}-{re:.2}")).collect();
+            println!("{s:8.2}-{e:8.2}  local={:.2}  keep [{}]", analysis.local_fraction(s, e), shown.join(", "));
         }
-        println!("would drop {dropped} of {} mic chunks", chunks.len());
+        println!("would keep {kept_secs:.0} s of {chunk_secs:.0} s mic chunk audio ({} chunks)", chunks.len());
 
         // Stored transcript lines whose "You" hint would no longer apply.
         let Ok(json) = std::fs::read_to_string(dir.join("transcripts.json")) else { return };

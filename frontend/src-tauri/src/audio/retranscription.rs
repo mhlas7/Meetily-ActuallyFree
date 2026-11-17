@@ -257,6 +257,34 @@ fn create_source_labeled_segments(
     Ok(segments)
 }
 
+/// The parts of a mic VAD chunk that carry local speech, as their own chunks.
+/// Chunk samples are 16 kHz and start at `start_timestamp_ms`, so region
+/// seconds map directly to sample offsets within the chunk.
+fn local_mic_pieces(
+    segment: crate::audio::vad::SpeechSegment,
+    bleed: &crate::diarization::bleed::BleedAnalysis,
+) -> Vec<crate::audio::vad::SpeechSegment> {
+    let start_s = segment.start_timestamp_ms / 1000.0;
+    let end_s = segment.end_timestamp_ms / 1000.0;
+    let regions = bleed.local_regions(start_s as f32, end_s as f32);
+    if regions == [(start_s as f32, end_s as f32)] {
+        return vec![segment];
+    }
+    regions
+        .into_iter()
+        .filter_map(|(region_start, region_end)| {
+            let offset = |s: f32| (((s as f64 - start_s) * 16_000.0).round().max(0.0) as usize).min(segment.samples.len());
+            let (from, to) = (offset(region_start), offset(region_end));
+            (to > from).then(|| crate::audio::vad::SpeechSegment {
+                samples: segment.samples[from..to].to_vec(),
+                start_timestamp_ms: segment.start_timestamp_ms + from as f64 / 16.0,
+                end_timestamp_ms: segment.start_timestamp_ms + to as f64 / 16.0,
+                confidence: segment.confidence,
+            })
+        })
+        .collect()
+}
+
 /// Decode one source track to 16 kHz mono samples, returning its duration.
 async fn decode_source<R: Runtime>(
     app: &AppHandle<R>,
@@ -410,18 +438,18 @@ async fn run_retranscription<R: Runtime>(
 
         info!("VAD detected {} {} segments", source_segments.len(), source_label);
         if speaker_hint == Some("You") && bleed.active {
-            // Only chunks that are almost entirely playback are dropped; any
-            // local speech, including double-talk, keeps the whole chunk.
+            // VAD chunks run up to several seconds and often hold a short local
+            // reply next to remote playback. Whisper would transcribe the
+            // playback too, so each chunk is cut to its local regions
+            // (double-talk counts as local); pure-playback chunks vanish.
             let before = source_segments.len();
-            source_segments.retain(|segment| {
-                !bleed.is_bleed(
-                    (segment.start_timestamp_ms / 1000.0) as f32,
-                    (segment.end_timestamp_ms / 1000.0) as f32,
-                )
-            });
+            source_segments = source_segments
+                .into_iter()
+                .flat_map(|segment| local_mic_pieces(segment, &bleed))
+                .collect();
             info!(
-                "Dropped {} of {} microphone chunks as speaker bleed",
-                before - source_segments.len(),
+                "Microphone chunks after speaker-bleed removal: {} (was {})",
+                source_segments.len(),
                 before
             );
         }
@@ -1167,6 +1195,64 @@ mod tests {
         super::RETRANSCRIPTION_CANCELLED.store(false, std::sync::atomic::Ordering::SeqCst);
     }
     use super::*;
+
+    /// Syllable-rate modulated noise inside `talk` (seconds), plus a noise floor.
+    fn talker(seed: u64, secs: f32, talk: &[(f32, f32)], amp: f32) -> Vec<f32> {
+        let mut state = seed;
+        let mut noise = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        };
+        (0..(secs * 16_000.0) as usize)
+            .map(|i| {
+                let t = i as f32 / 16_000.0;
+                let floor = 0.0005 * noise();
+                let voiced = talk.iter().any(|(s, e)| t >= *s && t < *e);
+                floor + if voiced { amp * (std::f32::consts::PI * 4.0 * t).sin().abs() * noise() } else { 0.0 }
+            })
+            .collect()
+    }
+
+    fn chunk(samples: &[f32], start_s: f32, end_s: f32) -> crate::audio::vad::SpeechSegment {
+        let (from, to) = ((start_s * 16_000.0) as usize, (end_s * 16_000.0) as usize);
+        crate::audio::vad::SpeechSegment {
+            samples: samples[from..to].to_vec(),
+            start_timestamp_ms: start_s as f64 * 1000.0,
+            end_timestamp_ms: end_s as f64 * 1000.0,
+            confidence: 0.9,
+        }
+    }
+
+    #[test]
+    fn mic_chunks_are_cut_to_local_speech() {
+        let system = talker(1, 40.0, &[(2.0, 12.0), (20.0, 32.0)], 0.3);
+        // 150 ms speaker->mic delay at -20 dB, plus a local reply after playback.
+        let mut mic: Vec<f32> = (0..system.len()).map(|i| if i >= 2400 { 0.1 * system[i - 2400] } else { 0.0 }).collect();
+        for (m, l) in mic.iter_mut().zip(talker(7, 40.0, &[(12.5, 14.0)], 0.3)) {
+            *m += l;
+        }
+        let bleed = crate::diarization::bleed::BleedAnalysis::analyze(&mic, &system);
+        assert!(bleed.active);
+
+        // Playback followed by the reply: only the reply survives, with
+        // timestamps and samples still aligned.
+        let pieces = local_mic_pieces(chunk(&mic, 9.0, 15.0), &bleed);
+        assert_eq!(pieces.len(), 1, "{:?}", pieces.iter().map(|p| (p.start_timestamp_ms, p.end_timestamp_ms)).collect::<Vec<_>>());
+        let piece = &pieces[0];
+        assert!(piece.start_timestamp_ms >= 12_100.0 && piece.start_timestamp_ms <= 12_500.0, "{}", piece.start_timestamp_ms);
+        assert!(piece.end_timestamp_ms >= 14_000.0 && piece.end_timestamp_ms <= 14_400.0, "{}", piece.end_timestamp_ms);
+        let offset = ((piece.start_timestamp_ms - 9_000.0) * 16.0).round() as usize;
+        assert_eq!(piece.samples[..], mic[144_000 + offset..144_000 + offset + piece.samples.len()]);
+        assert_eq!(piece.samples.len() as f64 / 16.0, piece.end_timestamp_ms - piece.start_timestamp_ms);
+
+        // Pure playback disappears; local-only chunks pass through unchanged.
+        assert!(local_mic_pieces(chunk(&mic, 22.0, 28.0), &bleed).is_empty());
+        let local = local_mic_pieces(chunk(&mic, 12.6, 13.8), &bleed);
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].samples.len(), chunk(&mic, 12.6, 13.8).samples.len());
+    }
 
     #[test]
     fn retranscription_repairs_duration_and_preserves_metadata() {
