@@ -1,9 +1,11 @@
 use crate::api::TranscriptSegment;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use log::{debug, info};
+use log::{debug, info, warn};
 use once_cell::sync::Lazy;
-use std::path::Path;
+use sqlx::SqlitePool;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -266,17 +268,83 @@ pub(crate) fn create_transcript_segments(
         .collect()
 }
 
-/// Write transcripts.json to a meeting folder (atomic write with temp file)
+/// Segment keys this writer produces from `TranscriptSegment`. Any other key in
+/// an existing file is a recording-time field to carry over.
+const TRANSCRIPT_JSON_WRITER_KEYS: [&str; 8] = [
+    "id",
+    "text",
+    "timestamp",
+    "audio_start_time",
+    "audio_end_time",
+    "duration",
+    "speaker",
+    "sequence_id",
+];
+
+/// Match key for one transcript line: start time in whole milliseconds plus
+/// trimmed text. File ids (`seg_N`) and DB ids (`transcript-<uuid>`) differ, so
+/// ids can't link a file segment to its DB row.
+fn transcript_json_match_key(audio_start_time: Option<f64>, text: &str) -> Option<(i64, String)> {
+    let start = audio_start_time.filter(|start| start.is_finite())?;
+    Some(((start * 1000.0).round() as i64, text.trim().to_string()))
+}
+
+/// Recording-time fields from an existing transcripts.json, keyed by
+/// `transcript_json_match_key`. A missing or malformed file yields no fields.
+fn previous_transcript_json_fields(
+    path: &Path,
+) -> HashMap<(i64, String), serde_json::Map<String, serde_json::Value>> {
+    let mut fields = HashMap::new();
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return fields;
+    };
+    let previous: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(previous) => previous,
+        Err(e) => {
+            debug!("Ignoring unreadable {} while rewriting it: {}", path.display(), e);
+            return fields;
+        }
+    };
+    let Some(segments) = previous.get("segments").and_then(|s| s.as_array()) else {
+        return fields;
+    };
+    for segment in segments.iter().filter_map(|s| s.as_object()) {
+        let start = segment.get("audio_start_time").and_then(|v| v.as_f64());
+        let text = segment.get("text").and_then(|v| v.as_str()).unwrap_or_default();
+        let Some(key) = transcript_json_match_key(start, text) else {
+            continue;
+        };
+        let kept: serde_json::Map<String, serde_json::Value> = segment
+            .iter()
+            .filter(|(name, _)| !TRANSCRIPT_JSON_WRITER_KEYS.contains(&name.as_str()))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        if !kept.is_empty() {
+            fields.insert(key, kept);
+        }
+    }
+    fields
+}
+
+/// Write transcripts.json to a meeting folder (atomic write with temp file).
+///
+/// `segments` usually come from the DB, which doesn't store the recording-time
+/// fields `recording_saver` writes during capture (`confidence`,
+/// `display_time`). So a rewrite keeps those fields from the existing file for
+/// every segment with the same start time and text. Fields this writer
+/// produces always come from `segments`. Retranscription can return a line
+/// with identical text and timing; it then keeps the earlier run's confidence.
 pub(crate) fn write_transcripts_json(folder: &Path, segments: &[TranscriptSegment]) -> Result<()> {
     let transcript_path = folder.join("transcripts.json");
     let temp_path = folder.join(".transcripts.json.tmp");
+    let previous_fields = previous_transcript_json_fields(&transcript_path);
 
     let json = serde_json::json!({
         "version": "1.0",
         "last_updated": chrono::Utc::now().to_rfc3339(),
         "total_segments": segments.len(),
         "segments": segments.iter().enumerate().map(|(i, s)| {
-            serde_json::json!({
+            let mut segment = serde_json::json!({
                 "id": s.id,
                 "text": s.text,
                 "timestamp": s.timestamp,
@@ -285,7 +353,15 @@ pub(crate) fn write_transcripts_json(folder: &Path, segments: &[TranscriptSegmen
                 "duration": s.duration,
                 "speaker": s.speaker,
                 "sequence_id": i
-            })
+            });
+            let carried = transcript_json_match_key(s.audio_start_time, &s.text)
+                .and_then(|key| previous_fields.get(&key));
+            if let (Some(carried), Some(segment)) = (carried, segment.as_object_mut()) {
+                for (name, value) in carried {
+                    segment.entry(name.clone()).or_insert_with(|| value.clone());
+                }
+            }
+            segment
         }).collect::<Vec<_>>()
     });
 
@@ -299,6 +375,43 @@ pub(crate) fn write_transcripts_json(folder: &Path, segments: &[TranscriptSegmen
         transcript_path.display()
     );
     Ok(())
+}
+
+/// Rewrite a meeting folder's transcripts.json from its DB rows, so the file
+/// shows the same speaker labels as the app. Call after any change to
+/// `transcripts.speaker`. A meeting without a folder on disk is skipped.
+pub(crate) async fn mirror_transcripts_json(pool: &SqlitePool, meeting_id: &str) -> Result<()> {
+    let folder: Option<Option<String>> =
+        sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
+            .bind(meeting_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some(folder) = folder.flatten().map(PathBuf::from).filter(|p| p.is_dir()) else {
+        return Ok(());
+    };
+    let rows = sqlx::query_as::<_, (String, String, String, Option<f64>, Option<f64>, Option<f64>, Option<String>)>(
+        "SELECT id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker \
+         FROM transcripts WHERE meeting_id = ? ORDER BY audio_start_time ASC",
+    )
+    .bind(meeting_id)
+    .fetch_all(pool)
+    .await?;
+    let segments: Vec<TranscriptSegment> = rows
+        .into_iter()
+        .map(|(id, text, timestamp, audio_start_time, audio_end_time, duration, speaker)| {
+            TranscriptSegment { id, text, timestamp, audio_start_time, audio_end_time, duration, speaker }
+        })
+        .collect();
+    write_transcripts_json(&folder, &segments)
+}
+
+/// `mirror_transcripts_json` for callers whose DB change has already
+/// committed. The DB stays the source of truth, so a file error is logged
+/// instead of failing the edit.
+pub(crate) async fn mirror_transcripts_json_logged(pool: &SqlitePool, meeting_id: &str) {
+    if let Err(e) = mirror_transcripts_json(pool, meeting_id).await {
+        warn!("Could not update transcripts.json for meeting {}: {}", meeting_id, e);
+    }
 }
 
 /// Split a long speech segment at the lowest-energy (silence) point near the target size.
@@ -479,5 +592,144 @@ mod tests {
         .unwrap();
 
         assert_eq!(json["segments"][0]["speaker"], "You");
+    }
+
+    fn segment(id: &str, text: &str, start: f64, speaker: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            id: id.to_string(),
+            text: text.to_string(),
+            timestamp: "2026-11-16T17:03:07.551Z".to_string(),
+            audio_start_time: Some(start),
+            audio_end_time: Some(start + 2.0),
+            duration: Some(2.0),
+            speaker: Some(speaker.to_string()),
+        }
+    }
+
+    /// A transcripts.json as `recording_saver` writes it during capture.
+    fn write_recording_time_json(folder: &Path) {
+        let json = serde_json::json!({
+            "version": "1.0",
+            "last_updated": "2026-11-16T17:28:00Z",
+            "total_segments": 2,
+            "segments": [
+                {"id": "seg_0", "text": "First line.", "audio_start_time": 0.0, "audio_end_time": 2.0,
+                 "duration": 2.0, "display_time": "17:03:14", "confidence": 0.85, "sequence_id": 0,
+                 "speaker": "Speaker 1"},
+                {"id": "seg_1", "text": " Second line. ", "audio_start_time": 5.975, "audio_end_time": 7.975,
+                 "duration": 2.0, "display_time": "17:03:19", "confidence": 0.21, "sequence_id": 1,
+                 "speaker": "Speaker 4"}
+            ]
+        });
+        std::fs::write(folder.join("transcripts.json"), json.to_string()).unwrap();
+    }
+
+    fn read_segments(folder: &Path) -> Vec<serde_json::Value> {
+        let json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(folder.join("transcripts.json")).unwrap(),
+        )
+        .unwrap();
+        json["segments"].as_array().unwrap().clone()
+    }
+
+    #[test]
+    fn transcripts_json_rewrite_keeps_recording_time_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        write_recording_time_json(dir.path());
+
+        let segments = vec![
+            segment("transcript-a", "First line.", 0.0, "Paul M."),
+            segment("transcript-b", "Second line.", 5.975, "Glenn R."),
+        ];
+        write_transcripts_json(dir.path(), &segments).unwrap();
+
+        let written = read_segments(dir.path());
+        assert_eq!(written[0]["speaker"], "Paul M.");
+        assert_eq!(written[0]["id"], "transcript-a");
+        assert_eq!(written[0]["timestamp"], "2026-11-16T17:03:07.551Z");
+        assert_eq!(written[0]["display_time"], "17:03:14");
+        assert_eq!(written[0]["confidence"], 0.85);
+        assert_eq!(written[1]["speaker"], "Glenn R.");
+        assert_eq!(written[1]["display_time"], "17:03:19");
+        assert_eq!(written[1]["confidence"], 0.21);
+    }
+
+    #[test]
+    fn transcripts_json_rewrite_drops_fields_when_text_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_recording_time_json(dir.path());
+
+        let segments = vec![segment("transcript-a", "A retranscribed line.", 0.0, "Speaker 1")];
+        write_transcripts_json(dir.path(), &segments).unwrap();
+
+        let written = read_segments(dir.path());
+        assert_eq!(written.len(), 1);
+        assert!(written[0].get("confidence").is_none());
+        assert!(written[0].get("display_time").is_none());
+    }
+
+    #[test]
+    fn transcripts_json_rewrite_ignores_malformed_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("transcripts.json"), "{ not json").unwrap();
+
+        write_transcripts_json(dir.path(), &[segment("transcript-a", "Hello.", 1.0, "You")]).unwrap();
+
+        let written = read_segments(dir.path());
+        assert_eq!(written[0]["speaker"], "You");
+        assert!(written[0].get("confidence").is_none());
+    }
+
+    async fn mirror_test_pool(folder_path: Option<&Path>) -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE meetings (id TEXT PRIMARY KEY, folder_path TEXT);
+             CREATE TABLE people (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, normalized_name TEXT NOT NULL UNIQUE, notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, is_manual INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, speaker_label TEXT NOT NULL, UNIQUE(meeting_id, speaker_label));
+             CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, transcript TEXT NOT NULL, timestamp TEXT NOT NULL, audio_start_time REAL, audio_end_time REAL, duration REAL, speaker TEXT, source_type TEXT);
+             INSERT INTO transcripts VALUES
+             ('transcript-a', 'm1', 'First line.', '2026-11-16T17:03:07.551Z', 0.0, 2.0, 2.0, 'Speaker 1', 'system'),
+             ('transcript-b', 'm1', 'Second line.', '2026-11-16T17:03:13.526Z', 5.975, 7.975, 2.0, 'Speaker 4', 'system');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO meetings VALUES ('m1', ?)")
+            .bind(folder_path.map(|p| p.to_string_lossy().to_string()))
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn mirror_transcripts_json_applies_speaker_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        write_recording_time_json(dir.path());
+        let pool = mirror_test_pool(Some(dir.path())).await;
+
+        crate::database::repositories::person::PeopleRepository::rename_meeting_speaker(
+            &pool, "m1", "Speaker 4", "Glenn R.",
+        )
+        .await
+        .unwrap();
+        mirror_transcripts_json(&pool, "m1").await.unwrap();
+
+        let written = read_segments(dir.path());
+        assert_eq!(written[0]["speaker"], "Speaker 1");
+        assert_eq!(written[1]["speaker"], "Glenn R.");
+        assert_eq!(written[1]["confidence"], 0.21);
+        assert_eq!(written[1]["display_time"], "17:03:19");
+    }
+
+    #[tokio::test]
+    async fn mirror_transcripts_json_skips_meetings_without_a_folder() {
+        let pool = mirror_test_pool(None).await;
+        mirror_transcripts_json(&pool, "m1").await.unwrap();
+
+        let missing = tempfile::tempdir().unwrap().path().join("gone");
+        let pool = mirror_test_pool(Some(&missing)).await;
+        mirror_transcripts_json(&pool, "m1").await.unwrap();
+        assert!(!missing.exists());
     }
 }

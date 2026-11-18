@@ -144,7 +144,7 @@ Paths below are relative to `frontend/src-tauri/src/` unless marked frontend.
 | `diarization/live_nemotron.rs` | Dedicated streaming inference thread, bounded queue, timestamped history, overlap lookup, error notification, and input-close/stop distinction. |
 | `diarization/nemotron.rs` | Validates the pinned model and adapts the attributed Sortformer API to Meetily. Live configuration must not change offline defaults. |
 | `diarization/sortformer/` | Attributed model implementation, including speaker cache, feed/flush, streaming profiles, and ORT session construction. Preserve license/attribution. |
-| `audio/recording_saver.rs`, `audio/incremental_saver.rs` | Persistent transcript/source hints and recording tracks. A displayed rename alone does not update every save path. |
+| `audio/recording_saver.rs`, `audio/incremental_saver.rs` | Persistent transcript/source hints and recording tracks. A displayed rename alone does not update every save path; speaker edits reach `transcripts.json` through `mirror_transcripts_json` (section 4). |
 | `diarization/bleed.rs` | Labs-gated (`micBleedFilter`, off by default) offline mic-vs-system speaker-bleed analysis used by diarization reruns and retranscription; see [MIC_BLEED_SUPPRESSION.md](MIC_BLEED_SUPPRESSION.md). Inactive (no behavior change) when no delay is found. |
 | `frontend/src/contexts/TranscriptContext.tsx` | Frontend transcript events, ordering/buffering, local recovery, and live state. |
 
@@ -226,6 +226,16 @@ saves the **post-call** default; it must not replace the live Parakeet selection
   Speaker edits preserve transcript rows, text, timestamps, and source provenance.
   Coverage: `combined-speakers`, `combined-speaker-edit`, `live-speaker-edits`, and
   the native person-repository regressions.
+- Speaker edits mirror into the meeting folder's `transcripts.json`. Renaming or
+  moving a speaker, renaming/merging/deleting a contact, and diarization reruns
+  call `audio/common.rs` `mirror_transcripts_json`, which rewrites the file from
+  DB rows after the DB change commits (file errors are logged, not returned).
+  The DB stores no recording-time fields (`confidence`, `display_time`), so
+  `write_transcripts_json` carries them over from the existing file for
+  segments with the same start time (ms) and trimmed text; file and DB ids
+  differ. Limit: a retranscribed line with identical text and timing keeps the
+  earlier run's confidence. Coverage: `transcripts_json_*` and
+  `mirror_transcripts_json_*` in `audio/common.rs`.
 - Markdown export uses `exportMarkdownFrontmatter.ts` and the current
   `useCopyOperations` hook. Named overlap components get separate optional links;
   generic labels do not become contacts. Other formats retain their old rendering.

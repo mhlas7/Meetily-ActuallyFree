@@ -746,6 +746,7 @@ pub async fn rename_meeting_speaker(
         "🧑‍🤝‍🧑 Renamed speaker '{}' → '{}' across {} segments of meeting {}",
         from, outcome.speaker, outcome.count, meeting_id
     );
+    crate::audio::common::mirror_transcripts_json_logged(state.db_manager.pool(), &meeting_id).await;
     Ok(MeetingSpeakerRenameResult {
         speaker: outcome.speaker,
         count: outcome.count,
@@ -772,6 +773,7 @@ pub async fn reassign_transcript_speaker(
     )
     .await
     .map_err(|e| format!("Failed to move this line: {}", e))?;
+    crate::audio::common::mirror_transcripts_json_logged(state.db_manager.pool(), &meeting_id).await;
     Ok(MeetingSpeakerRenameResult {
         speaker: outcome.speaker,
         count: outcome.count,
@@ -1591,32 +1593,7 @@ pub async fn diarize_meeting(
     }
 
     // Mirror the new labels into the meeting folder's transcripts.json.
-    if let Some(ref folder) = folder_path {
-        let p = PathBuf::from(folder);
-        if p.is_dir() {
-            if let Ok(db_transcripts) = sqlx::query_as::<_, (String, String, String, Option<f64>, Option<f64>, Option<f64>, Option<String>)>(
-                "SELECT id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker FROM transcripts WHERE meeting_id = ? ORDER BY audio_start_time ASC"
-            )
-            .bind(&meeting_id)
-            .fetch_all(pool)
-            .await
-            {
-                let segments_to_write: Vec<crate::api::TranscriptSegment> = db_transcripts
-                    .into_iter()
-                    .map(|(tid, text, ts, s, e, d, spk)| crate::api::TranscriptSegment {
-                        id: tid,
-                        text,
-                        timestamp: ts,
-                        audio_start_time: s,
-                        audio_end_time: e,
-                        duration: d,
-                        speaker: spk,
-                    })
-                    .collect();
-                let _ = crate::audio::common::write_transcripts_json(&p, &segments_to_write);
-            }
-        }
-    }
+    crate::audio::common::mirror_transcripts_json_logged(pool, &meeting_id).await;
     if preserved > 0 {
         log::info!(
             "🧑‍🤝‍🧑 Kept {} existing speaker label(s): named by the user, or no voice overlap",

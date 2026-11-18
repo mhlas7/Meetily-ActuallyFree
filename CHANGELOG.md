@@ -9,6 +9,9 @@
 - Make microphone/Ogg regression fixtures portable across Mac/FFmpeg builds (#56).
 
 - Preserve combined speaker labels in display, export, and component-level renames (#44/#45; from #38).
+- Mirror speaker renames, line moves, and contact rename/merge/delete into the
+  meeting's `transcripts.json`, keeping recording-time `confidence`/`display_time`
+  when the file is rewritten.
 - Own post-call processing above navigation, skip enhancement/diarization when
   keeping the live transcript, and scope cancellation to the active meeting (#31/#35).
 - Add Markdown frontmatter and optional Obsidian speaker links (#27).
