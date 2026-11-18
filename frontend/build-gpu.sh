@@ -37,6 +37,10 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+# Resolve the script's own directory before any cd: BASH_SOURCE can be a
+# relative path (e.g. ./frontend/build-gpu.sh) that breaks once we move.
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
 # Find the correct directory - we need to be in frontend root for npm commands
 if [ -f "package.json" ]; then
   FRONTEND_DIR="."
@@ -98,7 +102,6 @@ echo -e "${BLUE}🦙 Building llama-helper sidecar (release)...${NC}"
 HELPER_DIR="llama-helper"
 if [ ! -d "$HELPER_DIR" ]; then
     # Try to find it relative to script location
-    SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
     HELPER_DIR="$SCRIPT_DIR/../llama-helper"
 fi
 
