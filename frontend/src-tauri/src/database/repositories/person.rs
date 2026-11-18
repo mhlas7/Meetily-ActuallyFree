@@ -1181,8 +1181,15 @@ pub async fn api_update_person(
     role: Option<String>,
     phone: Option<String>,
 ) -> Result<PersonListItem, String> {
+    let pool = state.db_manager.pool();
+    let previous_name: Option<String> =
+        sqlx::query_scalar("SELECT display_name FROM people WHERE id = ?")
+            .bind(&person_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or_default();
     let item = PeopleRepository::update_person(
-        state.db_manager.pool(),
+        pool,
         &person_id,
         PersonInput {
             display_name,
@@ -1195,6 +1202,10 @@ pub async fn api_update_person(
     .await
     .map_err(|error| person_error("update contact", error))?;
     crate::diarization::voice_profiles::contact_renamed(&person_id, &item.display_name);
+    // Only a name change relabels transcripts; other contact edits leave the files alone.
+    if previous_name.as_deref() != Some(item.display_name.as_str()) {
+        mirror_person_meetings(pool, person_meeting_ids(pool, &person_id).await).await;
+    }
     Ok(item)
 }
 
@@ -1204,9 +1215,13 @@ pub async fn api_merge_people(
     source_id: String,
     target_id: String,
 ) -> Result<PersonListItem, String> {
-    let kept = PeopleRepository::merge_people(state.db_manager.pool(), &source_id, &target_id)
+    let pool = state.db_manager.pool();
+    // The merge moves the source's speaker links to the target, so collect first.
+    let relabeled = person_meeting_ids(pool, &source_id).await;
+    let kept = PeopleRepository::merge_people(pool, &source_id, &target_id)
         .await
         .map_err(|error| person_error("merge contacts", error))?;
+    mirror_person_meetings(pool, relabeled).await;
     crate::diarization::voice_profiles::contacts_merged(&source_id, &target_id, &kept.display_name);
     Ok(kept)
 }
@@ -1216,11 +1231,34 @@ pub async fn api_delete_person(
     state: tauri::State<'_, AppState>,
     person_id: String,
 ) -> Result<(), String> {
-    PeopleRepository::delete_person(state.db_manager.pool(), &person_id)
+    let pool = state.db_manager.pool();
+    // The delete removes the person's speaker links, so collect first.
+    let relabeled = person_meeting_ids(pool, &person_id).await;
+    PeopleRepository::delete_person(pool, &person_id)
         .await
         .map_err(|error| person_error("delete contact", error))?;
+    mirror_person_meetings(pool, relabeled).await;
     crate::diarization::voice_profiles::contact_deleted(&person_id);
     Ok(())
+}
+
+/// Meetings where this person is linked to a speaker label. Contact rename,
+/// merge, and delete relabel transcripts in exactly these meetings.
+async fn person_meeting_ids(pool: &SqlitePool, person_id: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT DISTINCT meeting_id FROM person_speakers WHERE person_id = ?")
+        .bind(person_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|error| {
+            log::warn!("Could not list meetings for contact {}: {}", person_id, error);
+            Vec::new()
+        })
+}
+
+async fn mirror_person_meetings(pool: &SqlitePool, meeting_ids: Vec<String>) {
+    for meeting_id in meeting_ids {
+        crate::audio::common::mirror_transcripts_json_logged(pool, &meeting_id).await;
+    }
 }
 
 async fn person_groups(
