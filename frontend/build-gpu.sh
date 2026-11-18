@@ -45,7 +45,9 @@ elif [ -f "frontend/package.json" ]; then
     echo -e "${RED}❌ Failed to change to frontend directory${NC}"
     exit 1
   }
-  FRONTEND_DIR="frontend"
+  # Every later path is relative to the current directory, which is now the
+  # frontend root, so it must be "." here too (not "frontend").
+  FRONTEND_DIR="."
 else
   echo -e "${RED}❌ Could not find package.json${NC}"
   echo -e "${RED}   Make sure you're in the project root or frontend directory${NC}"
