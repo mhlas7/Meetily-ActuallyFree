@@ -22,6 +22,26 @@ const MAX_SEARCH_LIMIT: i64 = 100;
 const PERSON_CONTEXT_CHARS: usize = 12_000;
 const MEETING_MESSAGE_CHARS: usize = 8_000;
 const MEETING_SUMMARY_CHARS: usize = 4_000;
+
+/// `person_speakers.source` values; see the person_speaker_source migration.
+pub(crate) const LINK_SAVED: &str = "saved";
+pub(crate) const LINK_USER: &str = "user";
+pub(crate) const LINK_MATCH: &str = "match";
+
+/// How strongly a write vouches for a speaker-to-contact link. Automatic voice
+/// updates learn only from `user` links and confident `match` links.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LinkClaim {
+    /// Saved with the meeting or carried forward: a new link is `saved`, and an
+    /// existing link keeps how it was made.
+    Saved,
+    /// The user named this speaker: the link becomes `user`.
+    User,
+    /// The user moved some lines to this name: a new link is `user`, but the
+    /// other lines under an existing link were not reviewed, so it keeps how it
+    /// was made.
+    UserIfNew,
+}
 const MESSAGE_TEXT_CHARS: usize = 1_000;
 
 #[derive(Debug, Clone, Serialize)]
@@ -534,7 +554,7 @@ impl PeopleRepository {
             // One identity link per named component, including overlap-only voices.
             for component in speaker_components(&label) {
                 if is_person_name(component) {
-                    Self::reconcile_speaker_identity(tx, meeting_id, component, component).await?;
+                    Self::reconcile_speaker_identity(tx, meeting_id, component, component, LinkClaim::Saved).await?;
                 }
             }
         }
@@ -751,6 +771,17 @@ impl PeopleRepository {
             .fetch_optional(&mut *tx)
             .await?;
             let new_label = if taken_by_other.is_some() { label.clone() } else { new_label };
+            // The link keeps how it was made. Where the target already spoke,
+            // its own link (and provenance) is the one kept.
+            let (link_source, match_score, match_margin): (String, Option<f64>, Option<f64>) = sqlx::query_as(
+                "SELECT source, match_score, match_margin FROM person_speakers \
+                 WHERE person_id = ? AND meeting_id = ? AND speaker_label = ?",
+            )
+            .bind(source_id)
+            .bind(&meeting_id)
+            .bind(&label)
+            .fetch_one(&mut *tx)
+            .await?;
 
             sqlx::query("DELETE FROM person_speakers WHERE person_id = ? AND meeting_id = ? AND speaker_label = ?")
                 .bind(source_id)
@@ -767,12 +798,16 @@ impl PeopleRepository {
                     .await?;
             }
             sqlx::query(
-                "INSERT INTO person_speakers (person_id, meeting_id, speaker_label) VALUES (?, ?, ?) \
+                "INSERT INTO person_speakers (person_id, meeting_id, speaker_label, source, match_score, match_margin) \
+                 VALUES (?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(meeting_id, speaker_label) DO UPDATE SET person_id = excluded.person_id",
             )
             .bind(target_id)
             .bind(&meeting_id)
             .bind(&new_label)
+            .bind(&link_source)
+            .bind(match_score)
+            .bind(match_margin)
             .execute(&mut *tx)
             .await?;
         }
@@ -920,7 +955,7 @@ impl PeopleRepository {
                 .execute(&mut *tx)
                 .await?;
         } else if count > 0 {
-            Self::reconcile_speaker_identity(&mut tx, meeting_id, from, &resolved_to).await?;
+            Self::reconcile_speaker_identity(&mut tx, meeting_id, from, &resolved_to, LinkClaim::User).await?;
         }
         tx.commit().await?;
         Ok(SpeakerRenameOutcome {
@@ -993,7 +1028,7 @@ impl PeopleRepository {
                 .bind(meeting_id).bind(selected).execute(&mut *tx).await?;
         }
         if is_person_name(&resolved_to) {
-            ensure_label_identity(&mut tx, meeting_id, &resolved_to).await?;
+            ensure_label_identity(&mut tx, meeting_id, &resolved_to, LinkClaim::UserIfNew).await?;
         }
         tx.commit().await?;
         Ok(SpeakerRenameOutcome {
@@ -1013,6 +1048,7 @@ impl PeopleRepository {
         meeting_id: &str,
         from: &str,
         to: &str,
+        claim: LinkClaim,
     ) -> Result<(), sqlx::Error> {
         if from != to {
             sqlx::query("DELETE FROM person_speakers WHERE meeting_id = ? AND speaker_label = ?")
@@ -1022,7 +1058,7 @@ impl PeopleRepository {
                 .await?;
         }
         if is_person_name(to) {
-            ensure_label_identity(tx, meeting_id, to).await?;
+            ensure_label_identity(tx, meeting_id, to, claim).await?;
         }
         Ok(())
     }
@@ -1254,6 +1290,7 @@ async fn ensure_label_identity(
     tx: &mut Transaction<'_, Sqlite>,
     meeting_id: &str,
     label: &str,
+    claim: LinkClaim,
 ) -> Result<(), sqlx::Error> {
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT person_id FROM person_speakers WHERE meeting_id = ? AND speaker_label = ?",
@@ -1263,6 +1300,17 @@ async fn ensure_label_identity(
     .fetch_optional(&mut **tx)
     .await?;
     if existing.is_some() {
+        if claim == LinkClaim::User {
+            sqlx::query(
+                "UPDATE person_speakers SET source = ?, match_score = NULL, match_margin = NULL \
+                 WHERE meeting_id = ? AND speaker_label = ?",
+            )
+            .bind(LINK_USER)
+            .bind(meeting_id)
+            .bind(label)
+            .execute(&mut **tx)
+            .await?;
+        }
         return Ok(());
     }
     let normalized = normalize_person_name(label);
@@ -1283,14 +1331,17 @@ async fn ensure_label_identity(
             id
         }
     };
+    let source = if claim == LinkClaim::Saved { LINK_SAVED } else { LINK_USER };
     sqlx::query(
-        "INSERT INTO person_speakers (person_id, meeting_id, speaker_label) \
-         VALUES (?, ?, ?) \
-         ON CONFLICT(meeting_id, speaker_label) DO UPDATE SET person_id = excluded.person_id",
+        "INSERT INTO person_speakers (person_id, meeting_id, speaker_label, source) \
+         VALUES (?, ?, ?, ?) \
+         ON CONFLICT(meeting_id, speaker_label) DO UPDATE SET person_id = excluded.person_id, \
+         source = excluded.source, match_score = NULL, match_margin = NULL",
     )
     .bind(person_id)
     .bind(meeting_id)
     .bind(label)
+    .bind(source)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1705,7 +1756,7 @@ async fn find_person_by_normalized_name(
 
 #[cfg(test)]
 mod tests {
-    use super::{
+    use super::{LINK_MATCH, LINK_SAVED, LINK_USER, 
         build_person_context, escape_like, is_person_name, normalize_person_name,
         visible_summary_text, PeopleRepository, PersonContextMeeting, PersonContextMessage,
         PERSON_CONTEXT_CHARS,
@@ -1716,7 +1767,7 @@ mod tests {
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlx::raw_sql(
             "CREATE TABLE people (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, normalized_name TEXT NOT NULL UNIQUE, notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, is_manual INTEGER NOT NULL DEFAULT 0);
-             CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, speaker_label TEXT NOT NULL, UNIQUE(meeting_id, speaker_label));
+             CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, speaker_label TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'saved', match_score REAL, match_margin REAL, UNIQUE(meeting_id, speaker_label));
              CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, speaker TEXT, transcript TEXT, audio_start_time REAL, source_type TEXT);
              INSERT INTO transcripts VALUES
              ('a', 'm1', 'Speaker 3', 'words a', 1.5, 'system'),
@@ -1859,13 +1910,13 @@ mod tests {
                  normalized_name TEXT NOT NULL UNIQUE, notes TEXT, created_at TEXT NOT NULL, \
                  updated_at TEXT NOT NULL, is_manual INTEGER NOT NULL DEFAULT 0); \
              CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, \
-                 speaker_label TEXT NOT NULL, UNIQUE(meeting_id, speaker_label)); \
+                 speaker_label TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'saved', match_score REAL, match_margin REAL, UNIQUE(meeting_id, speaker_label)); \
              CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, speaker TEXT); \
              INSERT INTO people (id, display_name, normalized_name, notes, created_at, updated_at) VALUES \
                  ('person-alice', 'Alice', 'alice', NULL, 'now', 'now'), \
                  ('person-bob', 'Bob', 'bob', NULL, 'now', 'now'), \
                  ('person-david', 'David', 'david', NULL, 'now', 'now'); \
-             INSERT INTO person_speakers VALUES \
+             INSERT INTO person_speakers (person_id, meeting_id, speaker_label) VALUES \
                  ('person-alice', 'm1', 'Alice'), ('person-alice', 'm2', 'Alice'), \
                  ('person-bob', 'm3', 'Bob'), ('person-david', 'm4', 'David'); \
              INSERT INTO transcripts VALUES ('t1', 'm1', 'Alice'), ('t2', 'm4', 'David');",
@@ -1930,7 +1981,7 @@ mod tests {
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlx::raw_sql(
             "CREATE TABLE people (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, normalized_name TEXT NOT NULL UNIQUE, notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); \
-             CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, speaker_label TEXT NOT NULL, UNIQUE(meeting_id, speaker_label)); \
+             CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, speaker_label TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'saved', match_score REAL, match_margin REAL, UNIQUE(meeting_id, speaker_label)); \
              CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, speaker TEXT); \
              INSERT INTO transcripts VALUES ('turn', 'meeting', 'Alice');"
         ).execute(&pool).await.unwrap();
@@ -1942,6 +1993,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn links_record_whether_the_user_or_a_save_made_them() {
+        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE people (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, normalized_name TEXT NOT NULL UNIQUE, notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); \
+             CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, speaker_label TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'saved', match_score REAL, match_margin REAL, UNIQUE(meeting_id, speaker_label)); \
+             CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, speaker TEXT); \
+             INSERT INTO people VALUES ('p-bob', 'Bob', 'bob', NULL, 'now', 'now'); \
+             INSERT INTO person_speakers VALUES ('p-bob', 'm1', 'Bob', 'match', 0.91, 0.2); \
+             INSERT INTO transcripts VALUES ('t1', 'm1', 'Alice'), ('t2', 'm1', 'Bob'), ('t3', 'm1', 'Bob'), ('t4', 'm1', 'Speaker 2');"
+        ).execute(&pool).await.unwrap();
+        let source = |label: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (String, Option<f64>)>(
+                    "SELECT source, match_score FROM person_speakers WHERE meeting_id = 'm1' AND speaker_label = ?",
+                ).bind(label).fetch_one(&pool).await.unwrap()
+            }
+        };
+
+        // Saving links new names as `saved` and leaves a voice match alone.
+        let mut tx = pool.begin().await.unwrap();
+        PeopleRepository::link_named_speakers(&mut tx, "m1").await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(source("Alice").await, (LINK_SAVED.to_string(), None));
+        assert_eq!(source("Bob").await, (LINK_MATCH.to_string(), Some(0.91)));
+
+        // Moving one line to Bob does not vouch for his other lines.
+        PeopleRepository::reassign_transcript_speaker(&pool, "m1", "t4", "Bob").await.unwrap();
+        assert_eq!(source("Bob").await.0, LINK_MATCH);
+        // Moving a line to a new name links it as the user's.
+        PeopleRepository::reassign_transcript_speaker(&pool, "m1", "t3", "Cara").await.unwrap();
+        assert_eq!(source("Cara").await, (LINK_USER.to_string(), None));
+
+        // Renaming a speaker is the user's word, even onto an existing link.
+        PeopleRepository::rename_meeting_speaker(&pool, "m1", "Alice", "Alice").await.unwrap();
+        assert_eq!(source("Alice").await, (LINK_USER.to_string(), None));
+        PeopleRepository::rename_meeting_speaker(&pool, "m1", "Bob", "Bob").await.unwrap();
+        assert_eq!(source("Bob").await, (LINK_USER.to_string(), None));
+    }
+
+    #[tokio::test]
     async fn rename_splits_when_old_person_has_another_label_in_same_meeting() {
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlx::raw_sql(
@@ -1949,10 +2041,10 @@ mod tests {
                  normalized_name TEXT NOT NULL UNIQUE, notes TEXT, created_at TEXT NOT NULL, \
                  updated_at TEXT NOT NULL, is_manual INTEGER NOT NULL DEFAULT 0); \
              CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, \
-                 speaker_label TEXT NOT NULL, UNIQUE(meeting_id, speaker_label)); \
+                 speaker_label TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'saved', match_score REAL, match_margin REAL, UNIQUE(meeting_id, speaker_label)); \
              CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, speaker TEXT); \
              INSERT INTO people (id, display_name, normalized_name, notes, created_at, updated_at) VALUES ('person-carol', 'Carol', 'carol', NULL, 'now', 'now'); \
-             INSERT INTO person_speakers VALUES \
+             INSERT INTO person_speakers (person_id, meeting_id, speaker_label) VALUES \
                  ('person-carol', 'm1', 'Carol'), ('person-carol', 'm1', 'C.'); \
              INSERT INTO transcripts VALUES ('t1', 'm1', 'Carol'), ('t2', 'm1', 'C.');",
         )
@@ -1995,7 +2087,7 @@ mod tests {
                  normalized_name TEXT NOT NULL UNIQUE, notes TEXT, created_at TEXT NOT NULL, \
                  updated_at TEXT NOT NULL, is_manual INTEGER NOT NULL DEFAULT 0); \
              CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, \
-                 speaker_label TEXT NOT NULL, UNIQUE(meeting_id, speaker_label)); \
+                 speaker_label TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'saved', match_score REAL, match_margin REAL, UNIQUE(meeting_id, speaker_label)); \
              CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, speaker TEXT); \
              INSERT INTO people (id, display_name, normalized_name, notes, created_at, updated_at) VALUES ('person-elodie', 'Élodie', 'Élodie', NULL, 'now', 'now'); \
              INSERT INTO transcripts VALUES ('t1', 'm1', 'Speaker 1');",
@@ -2052,7 +2144,7 @@ mod tests {
         sqlx::raw_sql(
             "CREATE TABLE people (id TEXT PRIMARY KEY, is_manual INTEGER NOT NULL DEFAULT 0); \
              CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, \
-                 speaker_label TEXT NOT NULL, UNIQUE(meeting_id, speaker_label)); \
+                 speaker_label TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'saved', match_score REAL, match_margin REAL, UNIQUE(meeting_id, speaker_label)); \
              CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, speaker TEXT); \
              INSERT INTO people (id) VALUES ('person-alice'); \
              INSERT INTO person_speakers (person_id, meeting_id, speaker_label) VALUES \
@@ -2111,14 +2203,14 @@ mod tests {
                  phone TEXT, is_manual INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT 'now', \
                  updated_at TEXT NOT NULL DEFAULT 'now'); \
              CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, \
-                 speaker_label TEXT NOT NULL, UNIQUE(meeting_id, speaker_label)); \
+                 speaker_label TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'saved', match_score REAL, match_margin REAL, UNIQUE(meeting_id, speaker_label)); \
              CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, speaker TEXT); \
              CREATE TABLE action_items (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, text TEXT NOT NULL, \
                  owner_label TEXT, person_id TEXT, updated_at TEXT NOT NULL DEFAULT 'now'); \
              INSERT INTO meetings (id) VALUES ('m1'), ('m2'); \
              INSERT INTO people (id, display_name, normalized_name, notes) VALUES \
                  ('p-tom', 'Tom', 'tom', 'Met at kickoff'), ('p-thomas', 'Thomas Becker', 'thomas becker', NULL); \
-             INSERT INTO person_speakers VALUES ('p-tom', 'm1', 'Tom'), ('p-thomas', 'm2', 'Thomas Becker'); \
+             INSERT INTO person_speakers (person_id, meeting_id, speaker_label) VALUES ('p-tom', 'm1', 'Tom'), ('p-thomas', 'm2', 'Thomas Becker'); \
              INSERT INTO transcripts VALUES ('t1', 'm1', 'Tom'), ('t2', 'm1', 'Speaker 1'), \
                  ('t3', 'm2', 'Thomas Becker'), ('t4', 'm2', 'You'); \
              INSERT INTO action_items (id, meeting_id, text, owner_label, person_id) VALUES \
@@ -2209,7 +2301,7 @@ mod tests {
     async fn merging_two_labels_from_one_meeting_joins_them() {
         let pool = contacts_pool().await;
         sqlx::raw_sql(
-            "INSERT INTO person_speakers VALUES ('p-tom', 'm2', 'Tom'); \
+            "INSERT INTO person_speakers (person_id, meeting_id, speaker_label) VALUES ('p-tom', 'm2', 'Tom'); \
              INSERT INTO transcripts VALUES ('t5', 'm2', 'Tom');",
         )
         .execute(&pool)

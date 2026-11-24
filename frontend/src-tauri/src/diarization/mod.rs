@@ -23,6 +23,7 @@ pub mod online;
 pub mod live_nemotron;
 pub mod voiceprint;
 pub mod voice_profiles;
+pub mod voice_autoupdate;
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -726,6 +727,7 @@ pub struct MeetingSpeakerRenameResult {
 
 #[tauri::command]
 pub async fn rename_meeting_speaker(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::state::AppState>,
     meeting_id: String,
     from: String,
@@ -745,6 +747,7 @@ pub async fn rename_meeting_speaker(
         "🧑‍🤝‍🧑 Renamed speaker '{}' → '{}' across {} segments of meeting {}",
         from, outcome.speaker, outcome.count, meeting_id
     );
+    voice_autoupdate::queue(&app, &meeting_id);
     Ok(MeetingSpeakerRenameResult {
         speaker: outcome.speaker,
         count: outcome.count,
@@ -755,6 +758,7 @@ pub async fn rename_meeting_speaker(
 /// Move a single transcript line to another speaker. The rest of that label stays put.
 #[tauri::command]
 pub async fn reassign_transcript_speaker(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::state::AppState>,
     meeting_id: String,
     transcript_id: String,
@@ -771,6 +775,7 @@ pub async fn reassign_transcript_speaker(
     )
     .await
     .map_err(|e| format!("Failed to move this line: {}", e))?;
+    voice_autoupdate::queue(&app, &meeting_id);
     Ok(MeetingSpeakerRenameResult {
         speaker: outcome.speaker,
         count: outcome.count,
@@ -986,6 +991,7 @@ fn ensure_wav(path: &Path) -> Result<(PathBuf, bool)> {
 /// Diarize a meeting's recording and assign "Speaker N" labels to its transcript segments.
 #[tauri::command]
 pub async fn diarize_meeting(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::state::AppState>,
     meeting_id: String,
     audio_path: Option<String>,
@@ -1027,7 +1033,7 @@ pub async fn diarize_meeting(
 
     let voiceprint_source = meeting_id.clone();
     let engine_for_blocking = selected_engine.clone();
-    let (result, used_source_tracks, profile_names) = tokio::task::spawn_blocking(move || -> Result<(DiarizationResult, bool, std::collections::HashMap<usize, String>)> {
+    let (result, used_source_tracks, profile_names) = tokio::task::spawn_blocking(move || -> Result<(DiarizationResult, bool, std::collections::HashMap<usize, voice_profiles::OfflineMatch>)> {
         let parent = source.parent().map(Path::to_path_buf);
         let mic_source = parent.as_ref().map(|p| p.join("mic.mp4"));
         let system_source = parent.as_ref().map(|p| p.join("system.mp4"));
@@ -1360,8 +1366,8 @@ pub async fn diarize_meeting(
         if let Some(manual_name) = cluster_to_manual_name.get(&spk) {
             return manual_name.clone();
         }
-        if let Some(name) = profile_names.get(&spk) {
-            return name.clone();
+        if let Some(matched) = profile_names.get(&spk) {
+            return matched.name.clone();
         }
         let display = match user_speaker {
             Some(user) if spk > user => spk,
@@ -1478,19 +1484,43 @@ pub async fn diarize_meeting(
 
     // Link contacts whose saved voice profile named a cluster in this meeting.
     // The labels are already saved, so a voice whose contact is gone is
-    // skipped and a failed link never fails the rerun.
+    // skipped and a failed link never fails the rerun. The link records the
+    // match score so automatic voice updates can tell a close match from a
+    // borderline one. An existing link keeps its contact, and one the user
+    // made stays `user`.
     let used_names: std::collections::HashSet<&str> = assignments.iter().map(|(_, label)| label.as_str()).collect();
+    let mut best_scores: std::collections::HashMap<&str, (f32, f32)> = std::collections::HashMap::new();
+    for (spk, matched) in &profile_names {
+        // A cluster the user's own name took over was not labeled by the match.
+        if cluster_to_manual_name.contains_key(spk) {
+            continue;
+        }
+        let entry = best_scores.entry(matched.name.as_str()).or_insert((matched.score, matched.margin));
+        if matched.score > entry.0 {
+            *entry = (matched.score, matched.margin);
+        }
+    }
     for (name, person_id) in voice_profiles::active_person_links() {
         if !used_names.contains(name.as_str()) {
             continue;
         }
+        let Some(&(score, margin)) = best_scores.get(name.as_str()) else {
+            continue;
+        };
         if let Err(error) = sqlx::query(
-            "INSERT OR IGNORE INTO person_speakers (person_id, meeting_id, speaker_label) \
-             SELECT id, ?, ? FROM people WHERE id = ?",
+            "INSERT INTO person_speakers (person_id, meeting_id, speaker_label, source, match_score, match_margin) \
+             SELECT id, ?, ?, ?, ?, ? FROM people WHERE id = ? \
+             ON CONFLICT(meeting_id, speaker_label) DO UPDATE SET \
+             source = excluded.source, match_score = excluded.match_score, match_margin = excluded.match_margin \
+             WHERE person_speakers.source != ? AND person_speakers.person_id = excluded.person_id",
         )
         .bind(&meeting_id)
         .bind(&name)
+        .bind(crate::database::repositories::person::LINK_MATCH)
+        .bind(score as f64)
+        .bind(margin as f64)
         .bind(&person_id)
+        .bind(crate::database::repositories::person::LINK_USER)
         .execute(pool)
         .await
         {
@@ -1511,6 +1541,7 @@ pub async fn diarize_meeting(
                     &meeting_id,
                     manual_name,
                     manual_name,
+                    crate::database::repositories::person::LinkClaim::Saved,
                 )
                 .await;
             }
@@ -1558,6 +1589,7 @@ pub async fn diarize_meeting(
         result.num_speakers,
         assignments.len()
     );
+    voice_autoupdate::queue(&app, &meeting_id);
 
     Ok(MeetingDiarizationResult {
         num_speakers: result.num_speakers,

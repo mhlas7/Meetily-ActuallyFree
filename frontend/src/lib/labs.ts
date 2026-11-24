@@ -2,6 +2,8 @@ export interface LabsPreferences {
   meetingAutomation: boolean;
   transcriptScrubbing: boolean;
   voiceProfiles: boolean;
+  /** Keep learned voices current after meetings and relabels; needs voiceProfiles. */
+  voiceAutoUpdate: boolean;
   whisperSilenceGuard: boolean;
   cleanTranscript: boolean;
   parakeetGpu: boolean;
@@ -11,6 +13,7 @@ export const defaultLabsPreferences: LabsPreferences = {
   meetingAutomation: false,
   transcriptScrubbing: false,
   voiceProfiles: false,
+  voiceAutoUpdate: false,
   whisperSilenceGuard: false,
   cleanTranscript: false,
   parakeetGpu: false,

@@ -71,7 +71,7 @@ const state = {
     ignored_apps: [] as string[],
     notify: true,
   },
-  labs: { whisperStrictSilence: false, voiceProfiles: false, parakeetGpu: false },
+  labs: { whisperStrictSilence: false, voiceProfiles: false, voiceAutoUpdate: false, parakeetGpu: false },
   voices: [{ person_id: 'person-tom', samples: 6, meetings: 1, from: ['meeting-acme-kickoff'] }] as Array<{
     person_id: string;
     samples: number;
@@ -432,6 +432,13 @@ function handle(cmd: string, args: Args): unknown {
       return state.labs.voiceProfiles;
     case 'set_voice_profiles_enabled':
       state.labs.voiceProfiles = !!args.value;
+      return null;
+    case 'get_voice_profiles_auto_update':
+      return state.labs.voiceAutoUpdate;
+    case 'set_voice_profiles_auto_update':
+      state.labs.voiceAutoUpdate = !!args.value;
+      return null;
+    case 'queue_voice_profile_update':
       return null;
     case 'get_parakeet_gpu_enabled':
       return state.labs.parakeetGpu;

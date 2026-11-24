@@ -546,7 +546,7 @@ mod tests {
             "CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, \
                  group_id TEXT, action_items_source TEXT); \
              CREATE TABLE people (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, normalized_name TEXT NOT NULL); \
-             CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, speaker_label TEXT NOT NULL); \
+             CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, speaker_label TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'saved', match_score REAL, match_margin REAL); \
              CREATE TABLE action_items (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, text TEXT NOT NULL, \
                  owner_label TEXT, person_id TEXT, due_text TEXT, done INTEGER NOT NULL DEFAULT 0, done_at TEXT, \
                  source TEXT NOT NULL DEFAULT 'user', edited INTEGER NOT NULL DEFAULT 0, audio_time REAL, \
@@ -554,7 +554,7 @@ mod tests {
                  updated_at TEXT NOT NULL); \
              INSERT INTO meetings (id, title, created_at) VALUES ('m1', 'Kickoff', '2026-09-01'); \
              INSERT INTO people VALUES ('person-priya', 'Priya Shah', 'priya shah'); \
-             INSERT INTO person_speakers VALUES ('person-priya', 'm1', 'Priya Shah');",
+             INSERT INTO person_speakers (person_id, meeting_id, speaker_label) VALUES ('person-priya', 'm1', 'Priya Shah');",
         )
         .execute(&pool)
         .await

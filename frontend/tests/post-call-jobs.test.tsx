@@ -62,14 +62,15 @@ test('navigation retains work; completion refreshes only its meeting on return',
 test('keep-live dismisses without enhancement or diarization', async () => {
   await act(async () => { root = create(<App />); });
   await act(async () => button('Keep live transcript').props.onClick());
-  expect(calls).toHaveLength(0);
+  // The live labels are final, so only the (Labs-gated) voice update is queued.
+  expect(calls).toEqual([['queue_voice_profile_update', { meetingId: 'a' }]]);
   expect(completeA).toHaveBeenCalledTimes(1);
 });
 
 test('Escape dismisses the prompt without starting work', async () => {
   await act(async () => { root = create(<App />); });
   await act(async () => root.root.findByType('section').props.onKeyDown({ key: 'Escape' }));
-  expect(calls).toHaveLength(0);
+  expect(calls).toEqual([['queue_voice_profile_update', { meetingId: 'a' }]]);
   expect(completeA).toHaveBeenCalledTimes(1);
 });
 

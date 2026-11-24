@@ -131,6 +131,7 @@ Paths below are relative to `frontend/src-tauri/src/` unless marked frontend.
 | `diarization/online.rs` | Selects the live engine at recording start; retains the existing Pyannote/WeSpeaker online clustering implementation. |
 | `diarization/live_nemotron.rs` | Dedicated streaming inference thread, bounded queue, timestamped history, overlap lookup, error notification, and input-close/stop distinction. |
 | `diarization/nemotron.rs` | Validates the pinned model and adapts the attributed Sortformer API to Meetily. Live configuration must not change offline defaults. |
+| `diarization/voice_autoupdate.rs` | Labs "Keep voices up to date": one native worker owning a coalesced set of pending meeting IDs. Queued after `diarize_meeting`, speaker relabels, and the post-call keep-live exit; updates or removes existing voices' per-meeting shares from `person_speakers` provenance. See [LABS_MACWHISPER_FEATURES.md](LABS_MACWHISPER_FEATURES.md) feature 7. |
 | `diarization/sortformer/` | Attributed model implementation, including speaker cache, feed/flush, streaming profiles, and ORT session construction. Preserve license/attribution. |
 | `audio/recording_saver.rs`, `audio/incremental_saver.rs` | Persistent transcript/source hints and recording tracks. A displayed rename alone does not update every save path. |
 | `frontend/src/contexts/TranscriptContext.tsx` | Frontend transcript events, ordering/buffering, local recovery, and live state. |
@@ -382,7 +383,7 @@ Labs roadmap features 1, 3, 7, 8, and 12 are mapped in
 changing meeting detection, recorded audio seeking, named voice enrollment,
 Whisper silence thresholds, or the clean transcript display. Settings > Labs
 holds the switches (`LabsSettings.tsx`, `lib/labs-features.ts`); the Whisper,
-voice-profile and Parakeet GPU switches also persist in native app data so they
+voice-profile, voice auto-update and Parakeet GPU switches also persist in native app data so they
 survive a WebView reload. Each feature also appears where it is used: the
 automation switch in Meeting detection, the waveform, slower speeds and
 Clean/Verbatim switch in the meeting player, voices on each contact's page and
