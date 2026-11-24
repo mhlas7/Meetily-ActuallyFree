@@ -8,7 +8,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import Link from 'next/link';
 import { invoke } from '@tauri-apps/api/core';
-import { AudioWaveform, Eraser, Fingerprint, Gauge, Speaker, VolumeX, Workflow, X, type LucideIcon } from 'lucide-react';
+import { AudioWaveform, Eraser, Fingerprint, Gauge, RefreshCw, Speaker, VolumeX, Workflow, X, type LucideIcon } from 'lucide-react';
 import { toast } from 'sonner';
 import { Switch } from '@/components/ui/switch';
 import { Avatar } from '@/components/ui/avatar';
@@ -144,6 +144,44 @@ function FeatureRow({
   );
 }
 
+/** Shown under Voice profiles while it is on; acts only together with it. */
+const VOICE_AUTO_UPDATE: Feature = {
+  key: 'voiceAutoUpdate',
+  icon: RefreshCw,
+  title: 'Keep voices up to date',
+  description:
+    "After a meeting's speakers are identified, or you relabel one, contacts who already have a voice learn from it. A voice match counts only when it is a close fit, and a speaker you move to someone else leaves that meeting out of the first contact's voice.",
+  where: 'Never learns a new voice; that stays on the contact page.',
+};
+
+function SubFeatureRow({
+  feature,
+  checked,
+  busy,
+  onChange,
+}: {
+  feature: Feature;
+  checked: boolean;
+  busy: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  const Icon = feature.icon;
+  return (
+    <div className="flex items-start gap-3 rounded-xl border border-af-border bg-af-panel px-3 py-2.5">
+      <Icon className="mt-0.5 h-4 w-4 shrink-0 text-af-accent" />
+      <div className="min-w-0 flex-1">
+        <h5 className="text-[13px] font-medium text-af-text">{feature.title}</h5>
+        <p className="mt-0.5 text-xs leading-relaxed text-af-text-3">{feature.description}</p>
+        <p className="mt-1 text-[11px] leading-relaxed text-af-text-4">{feature.where}</p>
+      </div>
+      <span className="mt-0.5 flex shrink-0 items-center gap-2">
+        {busy && <Spinner size={14} className="text-af-text-3" />}
+        <Switch checked={checked} disabled={busy} onCheckedChange={onChange} aria-label={feature.title} />
+      </span>
+    </div>
+  );
+}
+
 /** The learned voices, each linked to its contact. */
 function LearnedVoices() {
   const profiles = useVoiceProfiles();
@@ -215,7 +253,7 @@ export function LabsSettings() {
   const { labs } = useLabs();
   const [busy, setBusy] = useState<LabsFeature | null>(null);
 
-  // Four switches live in Rust; show what it actually has.
+  // Five switches live in Rust; show what it actually has.
   useEffect(() => {
     void syncLabsFromBackend().catch(() => undefined);
   }, []);
@@ -253,7 +291,17 @@ export function LabsSettings() {
                   busy={busy === feature.key}
                   onChange={(value) => void change(feature, value)}
                 >
-                  {feature.key === 'voiceProfiles' && labs.voiceProfiles ? <LearnedVoices /> : null}
+                  {feature.key === 'voiceProfiles' && labs.voiceProfiles ? (
+                    <div className="space-y-3">
+                      <SubFeatureRow
+                        feature={VOICE_AUTO_UPDATE}
+                        checked={labs.voiceAutoUpdate}
+                        busy={busy === VOICE_AUTO_UPDATE.key}
+                        onChange={(value) => void change(VOICE_AUTO_UPDATE, value)}
+                      />
+                      <LearnedVoices />
+                    </div>
+                  ) : null}
                 </FeatureRow>
               ))}
             </div>

@@ -1,7 +1,9 @@
 'use client';
 
-import { createContext, useCallback, useContext, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { toast } from 'sonner';
 import { PostCallProcessingWorker } from '@/components/MeetingDetails/PostCallProcessingWorker';
+import { onAutomaticVoiceUpdate } from '@/lib/voice-profiles';
 
 export interface PostCallView {
   meetingId: string;
@@ -25,6 +27,11 @@ export function PostCallJobsProvider({ children }: { children: React.ReactNode }
   const completed = useRef(new Set<string>());
   const dirty = useRef(new Set<string>());
   const [queue, setQueue] = useState<PostCallView[]>([]);
+  // Voices Rust updated after a meeting finished or a relabel; it owns that
+  // work, so this app-wide host only reports it.
+  useEffect(() => onAutomaticVoiceUpdate((names) => {
+    toast(`Updated voice${names.length === 1 ? '' : 's'}: ${names.join(', ')}`);
+  }), []);
   const attach = useCallback((view: PostCallView) => {
     views.current.set(view.meetingId, view);
     const isCompleted = completed.current.has(view.meetingId)

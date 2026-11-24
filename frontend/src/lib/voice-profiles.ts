@@ -5,6 +5,7 @@
  * current name and forgets it when the contact is deleted.
  */
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 
 export interface VoiceProfile {
   person_id: string;
@@ -52,6 +53,35 @@ export async function learnSpeakerVoice(meetingId: string, speaker: string): Pro
 export async function forgetVoice(personId: string): Promise<void> {
   await invoke('delete_voice_profile', { personId });
   announce();
+}
+
+/**
+ * Asks Rust to bring learned voices in step with a meeting whose labels are
+ * final. Rust owns the work from here and ignores it unless Labs > Keep voices
+ * up to date is on; nothing waits on it.
+ */
+export function queueVoiceUpdate(meetingId: string): void {
+  void invoke('queue_voice_profile_update', { meetingId }).catch(() => undefined);
+}
+
+/**
+ * Reports voices Rust updated on its own after a meeting finished or a speaker
+ * was relabeled. Returns a function that stops listening.
+ */
+export function onAutomaticVoiceUpdate(report: (names: string[]) => void): () => void {
+  let stopped = false;
+  let stop: (() => void) | undefined;
+  void listen<{ meetingId: string; names: string[] }>('voice-profiles-auto-updated', (event) => {
+    announce();
+    if (event.payload.names.length > 0) report(event.payload.names);
+  }).then((unlisten) => {
+    if (stopped) unlisten();
+    else stop = unlisten;
+  }).catch(() => undefined);
+  return () => {
+    stopped = true;
+    stop?.();
+  };
 }
 
 export function describeVoiceError(error: unknown): string {

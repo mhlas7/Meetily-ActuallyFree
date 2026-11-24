@@ -685,7 +685,7 @@ mod tests {
         sqlx::raw_sql(
             "CREATE TABLE meetings (id TEXT PRIMARY KEY, folder_path TEXT);
              CREATE TABLE people (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, normalized_name TEXT NOT NULL UNIQUE, notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, is_manual INTEGER NOT NULL DEFAULT 0);
-             CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, speaker_label TEXT NOT NULL, UNIQUE(meeting_id, speaker_label));
+             CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, speaker_label TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'saved', match_score REAL, match_margin REAL, UNIQUE(meeting_id, speaker_label));
              CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, transcript TEXT NOT NULL, timestamp TEXT NOT NULL, audio_start_time REAL, audio_end_time REAL, duration REAL, speaker TEXT, source_type TEXT);
              INSERT INTO transcripts VALUES
              ('transcript-a', 'm1', 'First line.', '2026-11-16T17:03:07.551Z', 0.0, 2.0, 2.0, 'Speaker 1', 'system'),

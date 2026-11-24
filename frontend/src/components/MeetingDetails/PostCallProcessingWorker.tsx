@@ -29,6 +29,7 @@ import { PostCallHandoffCard } from '@/components/PostCallHandoffCard';
 import type { RawModelInfo } from '@/hooks/useTranscriptionModels';
 import { isVisibleParakeetModel } from '@/lib/parakeet';
 import { announceChange } from '@/lib/workspace-api';
+import { queueVoiceUpdate } from '@/lib/voice-profiles';
 
 type Stage = 'idle' | 'prompt' | 'enhancing' | 'diarizing' | 'refreshing' | 'error';
 type FailedStage = 'enhancing' | 'diarizing' | 'pre-diarization-refresh' | 'post-diarization-refresh';
@@ -361,6 +362,8 @@ export function PostCallProcessingWorker({
     try {
       skippedEnhancementRef.current = true;
       await refreshTranscript('post-diarization-refresh');
+      // The live labels are final now. A diarization run queues this itself.
+      queueVoiceUpdate(meetingId);
       sessionStorage.setItem(storageKey, 'completed');
       setStage('idle');
       onComplete();

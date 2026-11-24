@@ -16,6 +16,10 @@ const PEOPLE_MIGRATION_CRLF_CHECKSUM: &str =
 // SQLite appends them to the stored definition, in this order.
 const PEOPLE_WORKSPACE_COLUMNS: &str = ", email TEXT, company TEXT, role TEXT, phone TEXT, \
      is_manual INTEGER NOT NULL DEFAULT 0 CHECK (is_manual IN (0, 1))";
+/// Link provenance added by the person_speaker_source migration. SQLite
+/// writes added columns after the last column, ahead of the table constraints.
+const PERSON_SPEAKER_SOURCE_COLUMNS: &str = ", source TEXT NOT NULL DEFAULT 'saved', match_score REAL, match_margin REAL";
+const PERSON_SPEAKER_LAST_COLUMN: &str = "speaker_label TEXT NOT NULL";
 
 #[derive(Clone)]
 pub struct DatabaseManager {
@@ -185,17 +189,28 @@ impl DatabaseManager {
     }
 
     /// A database repaired after the workspace migration has the original
-    /// `people` table plus exactly the workspace columns. Anything else differs.
+    /// `people` table plus exactly the workspace columns, and one repaired
+    /// after the person_speaker_source migration has the original
+    /// `person_speakers` table plus exactly the provenance columns. Anything
+    /// else differs.
     fn schema_sql_matches(name: &str, sql: &str, expected_sql: &str) -> bool {
         let actual = Self::normalize_schema_sql(sql);
         let expected = Self::normalize_schema_sql(expected_sql);
         if actual == expected {
             return true;
         }
-        name == "people"
-            && expected.strip_suffix(')').is_some_and(|columns| {
+        match name {
+            "people" => expected.strip_suffix(')').is_some_and(|columns| {
                 actual == format!("{columns}{})", Self::normalize_schema_sql(PEOPLE_WORKSPACE_COLUMNS))
-            })
+            }),
+            "person_speakers" => {
+                let last = Self::normalize_schema_sql(PERSON_SPEAKER_LAST_COLUMN);
+                let added = Self::normalize_schema_sql(PERSON_SPEAKER_SOURCE_COLUMNS);
+                expected.matches(&last).count() == 1
+                    && actual == expected.replacen(&last, &format!("{last}{added}"), 1)
+            }
+            _ => false,
+        }
     }
 
     fn normalize_schema_sql(sql: &str) -> String {

@@ -27,7 +27,8 @@ used:
   keeps each meeting's share, so learning from a meeting again replaces its
   share instead of counting it twice; profiles saved before shares were kept
   count as one earlier share. Renaming, merging or deleting a contact updates,
-  combines or removes their voice.
+  combines or removes their voice. A "Keep voices up to date" switch under
+  Voice profiles keeps existing voices current without the button (below).
 - Whisper silence guard and Parakeet GPU: tagged on the engine they change in
   Settings > Transcription.
 - Ignore speaker bleed during retranscription: applies when speaker labels are rerun or a meeting with
@@ -113,6 +114,50 @@ Live manual names now create person links when the meeting is saved. For older
 meetings whose transcript has a name but lacks that link, enrollment repairs the
 link using the saved label. Only generic labels prompt the user to name the
 speaker; a named label missing from the saved transcript reports that condition.
+
+### Keeping voices up to date (sub-switch, off by default)
+
+`voice_autoupdate.rs` owns one native worker over a coalesced set of pending
+meeting IDs; the switch persists in `voice_profiles_auto_update.txt` and acts
+only while Voice profiles is on. A meeting is queued when its labels are final
+or change: the end of a successful `diarize_meeting` (the post-call workflow and
+the header's rerun), the post-call "Keep live transcript"/dismiss exit
+(`queue_voice_profile_update`), and every `rename_meeting_speaker` and
+`reassign_transcript_speaker`. Never at recording stop, since retranscription
+and diarization are about to replace those rows. The worker waits 1.5 s so a
+burst of relabels settles into one pass, reads the meeting's links under the
+diarization operation guard, and embeds outside it so a pass never blocks an
+edit; an edit that lands mid-pass queues the meeting again.
+
+Only contacts who already have a voice are touched; learning a first voice
+stays manual. For each one the pass:
+
+- learns (replaces) this meeting's share when its link is trusted: a `user`
+  link, or a `match` link scoring ≥ 0.88 with a ≥ 0.12 lead over the next voice
+  (`LEARN_SCORE`/`LEARN_MARGIN`, a judgment call, not measured);
+- removes this meeting's share when the contact is no longer linked in the
+  meeting (a speaker moved to someone else), rebuilding from the rest; if fewer
+  than two turns would remain, the voice is kept and a warning logged;
+- leaves the voice alone for a `saved` or less confident link.
+
+`person_speakers.source` (migration `20261124000000_person_speaker_source`)
+records how each link was made: `user` for a rename (or a new name a moved line
+creates; moving a line onto an existing link keeps its provenance), `match`
+with `match_score`/`match_margin` for a post-call profile match (never
+overwriting `user`), and `saved` for links made when a meeting is saved and
+for all links that predate the column. Live-typed names and live Nemotron
+matches cannot be told apart at save, so names from the live path are not
+learned until the user relabels them. A recomputed share identical to the
+stored one is not an update. A pass that changed a voice emits
+`voice-profiles-auto-updated`; the app-wide `PostCallJobsProvider` shows a toast
+and refreshes voice lists. Pending IDs are dropped at shutdown; the work is
+idempotent and Update voice on the contact page catches up.
+
+Coverage: `voice_autoupdate` unit tests (plan per link, unchanged-share check),
+`voice_profiles` tests (scored match, learnable thresholds, share removal),
+`repositories::person` provenance test, the people-migration repair test with
+the provenance columns, and `tests/post-call-jobs.test.tsx` for the keep-live
+queue call. Embedding real audio is not exercised by these tests.
 
 ## Feature 8: Whisper silence guard
 

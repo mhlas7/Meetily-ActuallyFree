@@ -15,6 +15,11 @@ use super::models::DiarizationModels;
 const MODEL: &str = "wespeaker-resnet34-LM/lda-128";
 const MATCH_THRESHOLD: f32 = 0.80;
 const MATCH_MARGIN: f32 = 0.08;
+/// A voice match strong enough that automatic updates may learn from it. The
+/// stricter bar keeps one wrong match from teaching itself to the profile.
+/// Chosen by judgment, not measured; tune if updates are too rare or too loose.
+pub(super) const LEARN_SCORE: f32 = 0.88;
+pub(super) const LEARN_MARGIN: f32 = 0.12;
 const MAX_PROFILES: usize = 50;
 /// Clear turns learned from one meeting, spread across it.
 const LEARN_TURNS: usize = 20;
@@ -135,7 +140,12 @@ fn enabled_path() -> PathBuf {
     crate::paths::install_data_root().join("voice_profiles_enabled.txt")
 }
 
+fn auto_update_path() -> PathBuf {
+    crate::paths::install_data_root().join("voice_profiles_auto_update.txt")
+}
+
 static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
+static AUTO_UPDATE: OnceLock<AtomicBool> = OnceLock::new();
 static PROFILE_WRITE: Mutex<()> = Mutex::new(());
 static LIVE_MATCHER: Mutex<Option<LiveMatcher>> = Mutex::new(None);
 
@@ -178,9 +188,18 @@ pub fn name_live_nemotron_turn(label: &str, samples: &[f32]) -> Option<String> {
     matcher.names.get(label).cloned()
 }
 
+/// A remote channel named by a voice profile, with how clearly it matched.
+#[derive(Clone, Debug)]
+pub struct OfflineMatch {
+    pub name: String,
+    pub score: f32,
+    /// Lead over the next closest voice.
+    pub margin: f32,
+}
+
 /// Compare clean, non-overlapping system-track turns for each diarized remote
 /// channel. The caller keeps all unnamed channels and original timestamps.
-pub fn match_offline_speakers(track: &Path, segments: &[super::DiarizationSegment]) -> Result<HashMap<usize, String>> {
+pub fn match_offline_speakers(track: &Path, segments: &[super::DiarizationSegment]) -> Result<HashMap<usize, OfflineMatch>> {
     let profiles = load_for_matching()?;
     if profiles.is_empty() { return Ok(HashMap::new()); }
     let audio = crate::audio::decoder::decode_audio_file(track)?.to_whisper_format();
@@ -209,8 +228,8 @@ pub fn match_offline_speakers(track: &Path, segments: &[super::DiarizationSegmen
         for vector in &samples {
             for (target, value) in mean.iter_mut().zip(vector) { *target += *value; }
         }
-        if let Some(profile) = best_match(&mean, &profiles) {
-            names.insert(speaker, profile.name.clone());
+        if let Some((profile, score, margin)) = best_match_scored(&mean, &profiles) {
+            names.insert(speaker, OfflineMatch { name: profile.name.clone(), score, margin });
         }
     }
     Ok(names)
@@ -227,6 +246,37 @@ fn enabled_flag() -> &'static AtomicBool {
 
 pub fn enabled() -> bool {
     enabled_flag().load(Ordering::Relaxed)
+}
+
+fn auto_update_flag() -> &'static AtomicBool {
+    AUTO_UPDATE.get_or_init(|| {
+        let value = std::fs::read_to_string(auto_update_path())
+            .map(|text| text.trim() == "true")
+            .unwrap_or(false);
+        AtomicBool::new(value)
+    })
+}
+
+/// Automatic updates act only while voice profiles themselves are on.
+pub fn auto_update_enabled() -> bool {
+    enabled() && auto_update_flag().load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+pub fn get_voice_profiles_auto_update() -> bool {
+    auto_update_flag().load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+pub fn set_voice_profiles_auto_update(value: bool) -> Result<(), String> {
+    let file = auto_update_path();
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(file, if value { "true" } else { "false" })
+        .map_err(|error| error.to_string())?;
+    auto_update_flag().store(value, Ordering::Relaxed);
+    Ok(())
 }
 
 #[tauri::command]
@@ -246,7 +296,7 @@ pub fn set_voice_profiles_enabled(value: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn load() -> Result<Vec<VoiceProfile>> {
+pub(super) fn load() -> Result<Vec<VoiceProfile>> {
     let bytes = match std::fs::read(path()) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -293,19 +343,36 @@ fn similarity(a: &[f32], b: &[f32]) -> Option<f32> {
 }
 
 pub fn best_match<'a>(embedding: &[f32], profiles: &'a [VoiceProfile]) -> Option<&'a VoiceProfile> {
+    best_match_scored(embedding, profiles).map(|(profile, _, _)| profile)
+}
+
+/// The matching voice with its score and its lead over the runner-up.
+pub fn best_match_scored<'a>(embedding: &[f32], profiles: &'a [VoiceProfile]) -> Option<(&'a VoiceProfile, f32, f32)> {
     let mut ranked: Vec<(f32, &VoiceProfile)> = profiles.iter()
         .filter_map(|profile| similarity(embedding, &profile.embedding).map(|score| (score, profile)))
         .collect();
     ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
     let (score, profile) = *ranked.first()?;
     let runner_up = ranked.get(1).map(|entry| entry.0).unwrap_or(-1.0);
-    (score >= MATCH_THRESHOLD && score - runner_up >= MATCH_MARGIN).then_some(profile)
+    let margin = score - runner_up;
+    (score >= MATCH_THRESHOLD && margin >= MATCH_MARGIN).then_some((profile, score, margin))
+}
+
+/// Whether automatic updates may learn from a link made this way.
+pub(super) fn learnable_link(source: &str, score: Option<f64>, margin: Option<f64>) -> bool {
+    use crate::database::repositories::person::{LINK_MATCH, LINK_USER};
+    match source {
+        LINK_USER => true,
+        LINK_MATCH => matches!((score, margin), (Some(score), Some(margin))
+            if score >= LEARN_SCORE as f64 && margin >= LEARN_MARGIN as f64),
+        _ => false,
+    }
 }
 
 /// Why a voice could not be learned. `Unavailable` holds for every meeting
 /// (the feature is off, the models are missing, the list is full), so there
 /// is no point trying another one.
-enum EnrollError {
+pub(super) enum EnrollError {
     Unavailable(String),
     Meeting(String),
 }
@@ -336,7 +403,7 @@ fn embed_turns(track: &Path, turns: &[(f64, f64)]) -> Result<Vec<Vec<f32>>> {
 
 /// One meeting's share of a named speaker's voice, with the contact it
 /// belongs to.
-async fn meeting_share(
+pub(super) async fn meeting_share(
     pool: &SqlitePool,
     meeting_id: &str,
     speaker: &str,
@@ -414,7 +481,7 @@ async fn meeting_share(
 
 /// Adds (or, with `replace`, rebuilds from) meeting shares of a contact's
 /// voice and saves it.
-fn store_shares(person_id: &str, name: &str, shares: Vec<VoiceSource>, replace: bool) -> Result<VoiceProfileInfo, EnrollError> {
+pub(super) fn store_shares(person_id: &str, name: &str, shares: Vec<VoiceSource>, replace: bool) -> Result<VoiceProfileInfo, EnrollError> {
     use EnrollError::{Meeting, Unavailable};
     let _guard = PROFILE_WRITE.lock().map_err(|_| Unavailable("Voice profile lock poisoned".into()))?;
     let mut profiles = load().map_err(|error| Unavailable(error.to_string()))?;
@@ -515,7 +582,7 @@ pub fn delete_voice_profile(person_id: String) -> Result<(), String> {
 }
 
 /// Loads the saved voices, applies a change, and saves them if it changed any.
-fn edit_profiles(change: impl FnOnce(&mut Vec<VoiceProfile>) -> bool) -> Result<()> {
+pub(super) fn edit_profiles(change: impl FnOnce(&mut Vec<VoiceProfile>) -> bool) -> Result<()> {
     let _guard = PROFILE_WRITE.lock().map_err(|_| anyhow::anyhow!("Voice profile lock poisoned"))?;
     let mut profiles = load()?;
     if change(&mut profiles) {
@@ -549,6 +616,18 @@ fn merge(profiles: &mut Vec<VoiceProfile>, source_id: &str, target_id: &str, tar
     }
     rename(profiles, target_id, target_name);
     true
+}
+
+/// Removes one meeting's share from a voice and rebuilds it from the rest.
+/// `None` when the voice has no share from that meeting. A voice the rest
+/// cannot carry (under two turns) is an error, so the caller can keep it.
+pub(super) fn drop_share(profile: &VoiceProfile, meeting_id: &str) -> Result<Option<VoiceProfile>> {
+    if !profile.sources.iter().any(|share| share.meeting_id == meeting_id) {
+        return Ok(None);
+    }
+    let rest: Vec<VoiceSource> = profile.sources.iter()
+        .filter(|share| share.meeting_id != meeting_id).cloned().collect();
+    build_profile(profile.person_id.clone(), profile.name.clone(), rest).map(Some)
 }
 
 fn forget(profiles: &mut Vec<VoiceProfile>, person_id: &str) -> bool {
@@ -617,6 +696,44 @@ mod tests {
         let mut sum = vec![0.0; 128];
         sum[axis] = turns as f32;
         VoiceSource { meeting_id: meeting_id.into(), sum, turns }
+    }
+
+    #[test]
+    fn scored_matching_reports_the_lead_over_the_next_voice() {
+        let mut alice = vec![0.0; 128]; alice[0] = 1.0;
+        let mut bob = vec![0.0; 128]; bob[1] = 1.0;
+        let profiles = [voice_with("p1", "Alice", alice.clone()), voice_with("p2", "Bob", bob)];
+        let (profile, score, margin) = best_match_scored(&alice, &profiles).unwrap();
+        assert_eq!(profile.name, "Alice");
+        assert!((score - 1.0).abs() < 1e-6 && (margin - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn only_user_links_and_close_matches_are_learnable() {
+        assert!(learnable_link("user", None, None));
+        assert!(learnable_link("match", Some(0.88), Some(0.12)));
+        assert!(!learnable_link("match", Some(0.879), Some(0.3)));
+        assert!(!learnable_link("match", Some(0.95), Some(0.119)));
+        assert!(!learnable_link("match", None, None));
+        assert!(!learnable_link("saved", None, None));
+    }
+
+    #[test]
+    fn dropping_a_meeting_rebuilds_the_voice_from_the_rest() {
+        let profile = build_profile("p1".into(), "Alice".into(), vec![share("m1", 0, 2), share("m2", 1, 3)]).unwrap();
+        let rebuilt = drop_share(&profile, "m1").unwrap().unwrap();
+        assert_eq!(rebuilt.samples, 3);
+        assert_eq!(rebuilt.sources.len(), 1);
+        assert!((rebuilt.embedding[1] - 1.0).abs() < 1e-6);
+        // A meeting the voice never learned from changes nothing.
+        assert!(drop_share(&profile, "m9").unwrap().is_none());
+        // What is left must still be a usable voice.
+        let thin = build_profile("p1".into(), "Alice".into(), vec![share("m1", 0, 2), share("m2", 1, 1)]).unwrap();
+        assert!(drop_share(&thin, "m1").is_err());
+    }
+
+    fn voice_with(person_id: &str, name: &str, embedding: Vec<f32>) -> VoiceProfile {
+        VoiceProfile { person_id: person_id.into(), name: name.into(), embedding, samples: 2, model: MODEL.into(), sources: Vec::new() }
     }
 
     #[test]
